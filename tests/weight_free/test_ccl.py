@@ -12,13 +12,14 @@ Weight-free + Compute-Context-Length (CCL) compile/generate tests.
 from __future__ import annotations
 
 import pytest
+from transformers import AutoConfig
 
+from QEfficient.transformers.models.modeling_auto import QEFFAutoModelForCausalLM
 from QEfficient.utils.device_utils import get_available_device_id
 
 from ._helpers import (
     BATCH_SIZE,
     WEIGHT_FREE_CAUSAL_LM_MODEL_IDS,
-    build_meta_qeff_model,
     load_tokenizer,
     skip_on_model_fetch_error,
 )
@@ -56,11 +57,12 @@ def _generate(qeff_model, tokenizer, prompts):
 )
 def test_weight_free_ccl_compile_and_generate(model_type, model_id, tmp_export_dir):
     """Compile the shared weight-free + ccl_enabled export normally, compile with CCL, generate on each QPC."""
-    if model_type == "gpt_oss":
-        pytest.xfail()
-
     try:
-        qeff_model = build_meta_qeff_model(model_id, qaic_config={"ccl_enabled": True})
+        config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+        config.num_hidden_layers = 2
+        qeff_model = QEFFAutoModelForCausalLM.from_pretrained(
+            model_id, config=config, weight_free=True, qaic_config={"ccl_enabled": True}
+        )
         tokenizer = load_tokenizer(model_id)
     except Exception as exc:
         skip_on_model_fetch_error(exc, model_id)
@@ -73,7 +75,6 @@ def test_weight_free_ccl_compile_and_generate(model_type, model_id, tmp_export_d
         num_cores=16,
         batch_size=BATCH_SIZE,
         use_onnx_subfunctions=True,
-        use_weight_free_export=True,
         offload_pt_weights=False,
     )
     _generate(qeff_model, tokenizer, ["hello world"])
@@ -88,7 +89,6 @@ def test_weight_free_ccl_compile_and_generate(model_type, model_id, tmp_export_d
         num_cores=16,
         batch_size=BATCH_SIZE,
         use_onnx_subfunctions=True,
-        use_weight_free_export=True,
         offload_pt_weights=False,
     )
     _generate(qeff_model, tokenizer, ["hello world"])
