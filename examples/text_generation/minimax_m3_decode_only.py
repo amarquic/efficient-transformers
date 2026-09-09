@@ -8,6 +8,7 @@
 import argparse
 import os
 import tempfile
+import time
 
 import torch
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer, AutoModelForImageTextToText
@@ -139,10 +140,13 @@ def main():
     config = AutoConfig.from_pretrained(args.model_id)
     if args.num_layers is not None:
         config.text_config.num_hidden_layers = args.num_layers
-        factory_kwargs["config"] = config
+    factory_kwargs["config"] = config
 
+    t0 = time.perf_counter()
     qeff_model = QEFFAutoModelForImageTextToText.from_pretrained(args.model_id, **factory_kwargs)
+    print(f"[timing] model load:          {time.perf_counter() - t0:.2f}s")
 
+    t0 = time.perf_counter()
     qpc_paths = qeff_model.compile(
         batch_size=1,
         prefill_seq_len=1,
@@ -154,6 +158,7 @@ def main():
         use_onnx_subfunctions=False,
         skip_vision=True,
         offload_pt_weights=False,
+        log_times=True,
         qaic_config={
             "blocking_mode": "kv_headpar",
             "num_kv_blocks": 2,
@@ -165,6 +170,7 @@ def main():
             },
         },
     )
+    print(f"[timing] compile total:       {time.perf_counter() - t0:.2f}s")
     print(f"QPC paths: {qpc_paths}")
 
     if args.skip_generate:
@@ -188,7 +194,13 @@ def main():
         return_dict=True,
         return_tensors="pt",
     )
+    t0 = time.perf_counter()
     output = qeff_model.generate(inputs=inputs, generation_len=args.generation_len)
+    generate_time = time.perf_counter() - t0
+
+    num_generated = output.generated_ids.shape[-1]
+    toks_per_sec = num_generated / float(generate_time)
+    print(f"[timing] generation:          {generate_time:.2f}s  ({num_generated} tokens, {toks_per_sec:.02f} tok/s)")
 
     print(output.generated_ids)
     print(tokenizer.batch_decode(output.generated_ids))
