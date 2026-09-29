@@ -42,6 +42,7 @@ from QEfficient.exporter.weight_free.checkpoint_transforms import (
     GptOssMxfp4ExpertDequantSplitCheckpointTransform,
     MoEExpertStackingCheckpointTransform,
     MoEFusedExpertSplitCheckpointTransform,
+    ReplicateKVHeadCheckpointTransform,
 )
 from QEfficient.generation.cloud_infer import QAICInferenceSession, is_retained_state_name
 from QEfficient.generation.runner_io import (
@@ -3625,6 +3626,7 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         GptOssMxfp4ExpertDequantSplitCheckpointTransform,
         MoEExpertStackingCheckpointTransform,
         MoEFusedExpertSplitCheckpointTransform,
+        ReplicateKVHeadCheckpointTransform,
         ExpertParallelPackingCheckpointTransform,
         DtypeConversionCheckpointTransform,
     ]

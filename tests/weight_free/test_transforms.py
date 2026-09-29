@@ -55,12 +55,14 @@ from QEfficient.exporter.weight_free.checkpoint_transforms import (
     GraniteMoeFusedExpertSplitCheckpointTransform,
     MoEExpertStackingCheckpointTransform,
     MoEFusedExpertSplitCheckpointTransform,
+    ReplicateKVHeadCheckpointTransform,
 )
 from QEfficient.transformers.models.llama.modeling_llama import QEffLlamaDecoderLayer
 from QEfficient.transformers.models.modeling_auto import QEFFAutoModelForCausalLM
 from QEfficient.transformers.moe.weights import MoEWeights, pack_moe_weights_for_expert_parallel
 from QEfficient.utils import runtime_requirements
 from QEfficient.utils.export_utils import _generate_export_hash
+from QEfficient.utils.repeat_kv_utils import duplicate_kv_projection_weights
 from QEfficient.utils.runtime_requirements import validate_runtime_requirements
 from QEfficient.utils.torch_patches import temporarily_enable_nested_compile_regions
 
@@ -337,6 +339,148 @@ class TestWeightFreeCheckpointTransforms:
         torch.testing.assert_close(tensors[f"{prefix}.moe_weights.gate"], expected_weights.gate)
         torch.testing.assert_close(tensors[f"{prefix}.moe_weights.up"], expected_weights.up)
         torch.testing.assert_close(tensors[f"{prefix}.moe_weights.down"], expected_weights.down)
+
+    @pytest.mark.parametrize(("key_projection", "value_projection"), [("k_proj", "v_proj"), ("key_proj", "value_proj")])
+    def test_pipeline_replicates_kv_projections_with_live_transform_semantics(
+        self, tmp_path, key_projection, value_projection
+    ):
+        src = tmp_path / "src"
+        out = tmp_path / "out"
+        src.mkdir()
+        prefix = "model.layers.0.self_attn"
+        non_attention_prefix = "model.layers.0.mlp"
+        k_weight = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+        v_weight = k_weight + 100
+        k_bias = torch.arange(4, dtype=torch.float32)
+        v_bias = k_bias + 10
+        q_weight = torch.full((8, 8), 99.0)
+        unrelated_k_weight = torch.full((4, 8), 11.0)
+        unrelated_v_weight = torch.full((4, 8), 22.0)
+        _write_safetensors_checkpoint(
+            src,
+            {
+                f"{prefix}.{key_projection}.weight": k_weight,
+                f"{prefix}.{key_projection}.bias": k_bias,
+                f"{prefix}.{value_projection}.weight": v_weight,
+                f"{prefix}.{value_projection}.bias": v_bias,
+                f"{prefix}.q_proj.weight": q_weight,
+                f"{non_attention_prefix}.k_proj.weight": unrelated_k_weight,
+                f"{non_attention_prefix}.v_proj.weight": unrelated_v_weight,
+            },
+        )
+
+        def expected_projection(weight, bias):
+            projection = torch.nn.Linear(8, 4, bias=True)
+            projection.weight.data.copy_(weight)
+            projection.bias.data.copy_(bias)
+            duplicate_kv_projection_weights(
+                projection,
+                orig_kv_heads=2,
+                repeat=2,
+                head_dim=2,
+                hidden_size=8,
+            )
+            return projection.weight.detach(), projection.bias.detach()
+
+        expected_k_weight, expected_k_bias = expected_projection(k_weight, k_bias)
+        expected_v_weight, expected_v_bias = expected_projection(v_weight, v_bias)
+        pipeline = CheckpointTransformPipeline([ReplicateKVHeadCheckpointTransform, DtypeConversionCheckpointTransform])
+        config = SimpleNamespace(
+            text_config=None,
+            orig_kv_heads=2,
+            num_key_value_heads=4,
+            num_attention_heads=4,
+            hidden_size=8,
+        )
+        replicated_plan, _ = pipeline.build_plan(
+            src,
+            torch.float32,
+            config=config,
+            hash_params={"num_replicate_kv_heads": 2},
+        )
+        unreplicated_plan, _ = pipeline.build_plan(
+            src,
+            torch.float32,
+            config=config,
+            hash_params={"num_replicate_kv_heads": 1},
+        )
+
+        assert replicated_plan.fingerprint_payload() != unreplicated_plan.fingerprint_payload()
+
+        from QEfficient.exporter.weight_free.export import _prepared_checkpoint_hash
+
+        prepared_hash_args = {
+            "model_ref": str(src),
+            "target_dtype": torch.float32,
+            "active_group_transform_id": "none",
+            "moe_prefill_flavour": "none",
+        }
+        assert _prepared_checkpoint_hash(
+            **prepared_hash_args,
+            plan_payload=replicated_plan.fingerprint_payload(),
+        ) != _prepared_checkpoint_hash(
+            **prepared_hash_args,
+            plan_payload=unreplicated_plan.fingerprint_payload(),
+        )
+
+        pipeline.apply(src, out, target_dtype=torch.float32, plan=replicated_plan, max_workers=1)
+
+        tensors = _load_prepared_tensors(out)
+        torch.testing.assert_close(tensors[f"{prefix}.{key_projection}.weight"], expected_k_weight)
+        torch.testing.assert_close(tensors[f"{prefix}.{key_projection}.bias"], expected_k_bias)
+        torch.testing.assert_close(tensors[f"{prefix}.{value_projection}.weight"], expected_v_weight)
+        torch.testing.assert_close(tensors[f"{prefix}.{value_projection}.bias"], expected_v_bias)
+        torch.testing.assert_close(tensors[f"{prefix}.q_proj.weight"], q_weight)
+        torch.testing.assert_close(tensors[f"{non_attention_prefix}.k_proj.weight"], unrelated_k_weight)
+        torch.testing.assert_close(tensors[f"{non_attention_prefix}.v_proj.weight"], unrelated_v_weight)
+
+    def test_kv_replication_rejects_unsupported_projection_layout(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        _write_safetensors_checkpoint(src, {"model.layers.0.self_attn.q_proj.weight": torch.ones(8, 8)})
+        pipeline = CheckpointTransformPipeline([ReplicateKVHeadCheckpointTransform, DtypeConversionCheckpointTransform])
+        config = SimpleNamespace(
+            orig_kv_heads=2,
+            num_key_value_heads=4,
+            num_attention_heads=4,
+            hidden_size=8,
+        )
+
+        with pytest.raises(ValueError, match="no native k_proj/key_proj"):
+            pipeline.build_plan(
+                src,
+                torch.float32,
+                config=config,
+                hash_params={"num_replicate_kv_heads": 2},
+            )
+
+    def test_kv_replication_rejects_non_native_projection_layout(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        prefix = "model.layers.0.self_attn"
+        _write_safetensors_checkpoint(
+            src,
+            {
+                f"{prefix}.k_proj.weight": torch.ones(4, 8),
+                f"{prefix}.k_proj.weight_scale": torch.ones(4, 1),
+                f"{prefix}.v_proj.weight": torch.ones(4, 8),
+            },
+        )
+        pipeline = CheckpointTransformPipeline([ReplicateKVHeadCheckpointTransform, DtypeConversionCheckpointTransform])
+        config = SimpleNamespace(
+            orig_kv_heads=2,
+            num_key_value_heads=4,
+            num_attention_heads=4,
+            hidden_size=8,
+        )
+
+        with pytest.raises(ValueError, match="non-native layout tensor"):
+            pipeline.build_plan(
+                src,
+                torch.float32,
+                config=config,
+                hash_params={"num_replicate_kv_heads": 2},
+            )
 
     def test_pipeline_dequantizes_gptoss_to_canonical_final_keys(self, tmp_path):
         src = tmp_path / "src"

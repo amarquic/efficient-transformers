@@ -33,6 +33,7 @@ from QEfficient.base.checkpoint_transforms import (
 )
 from QEfficient.transformers.quantizers.quantizer_utils import convert_moe_packed_tensors
 from QEfficient.utils.checkpoint_utils import safetensors_dtype_to_torch
+from QEfficient.utils.config_utils import resolve_attention_heads, resolve_hidden_size, resolve_kv_heads
 
 # ---------------------------------------------------------------------------
 # Canonical key mapping helpers
@@ -172,6 +173,22 @@ class DtypeConversionCheckpointTransform(BaseCheckpointTransform):
     @classmethod
     def plan_tasks(cls, context: CheckpointPlanningContext) -> None:
         _plan_dtype_stages(cls, context)
+
+
+class ReplicateKVHeadCheckpointTransform(BaseCheckpointTransform):
+    """Replicate native K/V projection checkpoint tensors for weight-free export."""
+
+    TRANSFORM_ID = "replicate_kv_heads_v1"
+
+    @classmethod
+    def is_applicable(cls, weight_map: Dict[str, str], **kwargs) -> bool:
+        del weight_map
+        factor = kwargs.get("hash_params", {}).get("num_replicate_kv_heads", 1)
+        return factor is not None and int(factor) > 1
+
+    @classmethod
+    def plan_tasks(cls, context: CheckpointPlanningContext) -> None:
+        _plan_kv_replication_stages(cls, context)
 
 
 # ---------------------------------------------------------------------------
@@ -596,6 +613,213 @@ def _make_dtype_stage(cls, input_refs: tuple[TensorRef, ...], target_dtype: torc
         runner=runner,
         labels=("dtype",),
     )
+
+
+_KV_ATTENTION_PREFIX_RE = r"((?:.+\.)?(?:cross_attn|self_attn|attention|attn))"
+_KV_PROJECTION_WEIGHT_RE = re.compile(rf"^{_KV_ATTENTION_PREFIX_RE}\.(k_proj|key_proj|v_proj|value_proj)\.weight$")
+_KV_PROJECTION_NON_NATIVE_RE = re.compile(
+    rf"^{_KV_ATTENTION_PREFIX_RE}\.(?:k_proj|key_proj|v_proj|value_proj)\.(?:qweight|qzeros|scales|weight_scale)$"
+)
+_NATIVE_KV_PROJECTION_DTYPES = {torch.float16, torch.bfloat16, torch.float32, torch.float64}
+
+
+def _kv_replication_params(context: CheckpointPlanningContext) -> Optional[tuple[int, int, int, int]]:
+    factor = context.hash_params.get("num_replicate_kv_heads", 1)
+    if factor is None:
+        return None
+    factor = int(factor)
+    if factor <= 1:
+        return None
+
+    config = getattr(context.config, "text_config", None) or context.config
+    orig_kv_heads = getattr(config, "orig_kv_heads", None)
+    new_kv_heads = resolve_kv_heads(config)
+    num_attention_heads = resolve_attention_heads(config)
+    hidden_size = resolve_hidden_size(config)
+    if orig_kv_heads is None or new_kv_heads is None or num_attention_heads is None or hidden_size is None:
+        raise ValueError(
+            "KV head replication requires orig_kv_heads, KV heads, attention heads, and hidden size in the model config."
+        )
+
+    orig_kv_heads = int(orig_kv_heads)
+    new_kv_heads = int(new_kv_heads)
+    num_attention_heads = int(num_attention_heads)
+    hidden_size = int(hidden_size)
+    head_dim = getattr(config, "head_dim", None)
+    if head_dim is None:
+        if hidden_size % num_attention_heads != 0:
+            raise ValueError(
+                "Unable to derive KV head_dim: hidden size must be divisible by the number of attention heads."
+            )
+        head_dim = hidden_size // num_attention_heads
+    head_dim = int(head_dim)
+
+    if orig_kv_heads <= 0 or head_dim <= 0:
+        raise ValueError("KV head replication requires positive orig_kv_heads and head_dim.")
+    if new_kv_heads != orig_kv_heads * factor:
+        raise ValueError(
+            "KV head replication config does not match num_replicate_kv_heads: "
+            f"expected {orig_kv_heads * factor} KV heads, got {new_kv_heads}."
+        )
+
+    return factor, orig_kv_heads, new_kv_heads, head_dim
+
+
+def _kv_projection_groups(weight_map: Dict[str, str]) -> dict[str, dict[str, str]]:
+    groups: dict[str, dict[str, str]] = {}
+    for key in sorted(weight_map):
+        match = _KV_PROJECTION_WEIGHT_RE.match(key)
+        if match is None:
+            continue
+        prefix, projection = match.groups()
+        kind = "key" if projection in {"k_proj", "key_proj"} else "value"
+        existing = groups.setdefault(prefix, {}).get(kind)
+        if existing is not None:
+            raise ValueError(f"KV head replication found multiple {kind} projections for {prefix}: {existing}, {key}.")
+        groups[prefix][kind] = key
+    return groups
+
+
+def _replicate_kv_projection_tensor(
+    tensor: torch.Tensor,
+    *,
+    key: str,
+    factor: int,
+    orig_kv_heads: int,
+    new_kv_heads: int,
+    head_dim: int,
+    hidden_size: int,
+    is_bias: bool,
+) -> torch.Tensor:
+    if tensor.dtype not in _NATIVE_KV_PROJECTION_DTYPES:
+        raise ValueError(
+            "KV head replication supports only native unfused floating-point K/V projections; "
+            f"{key} has dtype {tensor.dtype}."
+        )
+
+    expected_rows = orig_kv_heads * head_dim
+    if is_bias:
+        if tensor.ndim != 1 or tensor.shape[0] != expected_rows:
+            raise ValueError(f"KV projection bias {key} must have shape ({expected_rows},), got {tuple(tensor.shape)}.")
+        return tensor.view(orig_kv_heads, head_dim).repeat_interleave(factor, dim=0).reshape(new_kv_heads * head_dim)
+
+    if tensor.ndim != 2 or tuple(tensor.shape) != (expected_rows, hidden_size):
+        raise ValueError(
+            f"KV projection weight {key} must have shape ({expected_rows}, {hidden_size}), got {tuple(tensor.shape)}."
+        )
+    return (
+        tensor.view(orig_kv_heads, head_dim, hidden_size)
+        .repeat_interleave(factor, dim=0)
+        .reshape(new_kv_heads * head_dim, hidden_size)
+        .contiguous()
+    )
+
+
+def _plan_kv_replication_stages(cls, context: CheckpointPlanningContext) -> None:
+    params = _kv_replication_params(context)
+    if params is None:
+        return
+    factor, orig_kv_heads, new_kv_heads, head_dim = params
+    config = getattr(context.config, "text_config", None) or context.config
+    hidden_size = int(resolve_hidden_size(config))
+    non_native_key = next((key for key in sorted(context.weight_map) if _KV_PROJECTION_NON_NATIVE_RE.match(key)), None)
+    if non_native_key is not None:
+        raise ValueError(
+            "KV head replication supports only native unfused floating-point K/V projections; "
+            f"non-native layout tensor detected: {non_native_key}."
+        )
+    groups = _kv_projection_groups(context.weight_map)
+    if not groups:
+        raise ValueError(
+            "KV head replication requested, but no native k_proj/key_proj and v_proj/value_proj checkpoint weights were found."
+        )
+
+    for index, (prefix, projections) in enumerate(sorted(groups.items())):
+        missing = {"key", "value"} - set(projections)
+        if missing:
+            raise ValueError(f"KV head replication projection group {prefix} is missing {sorted(missing)} weight(s).")
+
+        weight_keys = tuple(sorted(projections.values()))
+        bias_keys = tuple(
+            weight_key[: -len("weight")] + "bias"
+            for weight_key in weight_keys
+            if weight_key[: -len("weight")] + "bias" in context.weight_map
+        )
+        input_refs = _task_refs(weight_keys + bias_keys)
+        output_refs = tuple(TensorRef(ref.key, "kv_replicated") for ref in input_refs)
+        weight_refs = {TensorRef(key) for key in weight_keys}
+
+        def runner(
+            get_tensor,
+            target_dtype,
+            input_refs=input_refs,
+            output_refs=output_refs,
+            weight_refs=weight_refs,
+            factor=factor,
+            orig_kv_heads=orig_kv_heads,
+            new_kv_heads=new_kv_heads,
+            head_dim=head_dim,
+            hidden_size=hidden_size,
+        ):
+            del target_dtype
+            outputs = {}
+            for input_ref, output_ref in zip(input_refs, output_refs):
+                outputs[output_ref] = _replicate_kv_projection_tensor(
+                    get_tensor(input_ref),
+                    key=input_ref.key,
+                    factor=factor,
+                    orig_kv_heads=orig_kv_heads,
+                    new_kv_heads=new_kv_heads,
+                    head_dim=head_dim,
+                    hidden_size=hidden_size,
+                    is_bias=input_ref not in weight_refs,
+                )
+            return outputs
+
+        output_file = f"kv-replicate-{index:05d}.safetensors"
+        task_plan = CheckpointTaskPlan(
+            task_id=f"kv-replicate:{prefix}",
+            input_refs=input_refs,
+            source_files=tuple(sorted({context.weight_map[ref.key] for ref in input_refs})),
+            output_file=output_file,
+            estimated_peak_bytes=_estimate_task_bytes(
+                context.source_dir,
+                context.weight_map,
+                tuple(ref.key for ref in input_refs),
+                context.target_dtype,
+                output_copies=factor * 2,
+            ),
+            params=TaskParams(
+                cls.TRANSFORM_ID,
+                _task_values(
+                    factor=factor,
+                    head_dim=head_dim,
+                    keys=tuple(ref.key for ref in input_refs),
+                    new_kv_heads=new_kv_heads,
+                    orig_kv_heads=orig_kv_heads,
+                    output_file=output_file,
+                ),
+            ),
+        )
+        task_plan.append_stage(
+            CheckpointStage(
+                stage_id="replicate_kv_heads",
+                input_refs=input_refs,
+                output_refs=output_refs,
+                params=TaskParams(
+                    cls.TRANSFORM_ID,
+                    _task_values(
+                        factor=factor,
+                        head_dim=head_dim,
+                        new_kv_heads=new_kv_heads,
+                        orig_kv_heads=orig_kv_heads,
+                    ),
+                ),
+                runner=runner,
+                labels=("replicate_kv_heads",),
+            )
+        )
+        context.add_task_plan(task_plan)
 
 
 def _plan_dtype_stages(cls, context: CheckpointPlanningContext) -> None:
