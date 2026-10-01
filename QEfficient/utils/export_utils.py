@@ -33,8 +33,6 @@ from QEfficient.utils.cache import QEFF_HOME
 from QEfficient.utils.constants import (
     _KNOWN_DECODER_LAYER_ATTR_PATHS,
     _KNOWN_DECODER_LAYER_SUFFIXES,
-    DYNAMO_DIM_MAX_BATCH_SIZE,
-    DYNAMO_DIM_MIN_COMP_CTX_LENGTHS,
 )
 from QEfficient.utils.hash_utils import create_export_hash
 from QEfficient.utils.logging_utils import logger
@@ -59,25 +57,33 @@ def export_from_compile():
 
 
 def reorder_inputs_by_signature(model, example_inputs, dynamic_shapes=None):
-    """Reorder example_inputs (and optional dynamic_shapes) to match model.forward signature.
+    """Reorder inputs and align dynamic-shape containers with the forward signature."""
 
-    torch.export requires inputs and dynamic_shapes to follow the forward parameter order
-    so that each shape constraint binds to the correct input tensor.
-    """
+    def align_structure(shape_spec, example_input):
+        if isinstance(example_input, tuple) and isinstance(shape_spec, (list, tuple)):
+            return tuple(align_structure(spec, value) for spec, value in zip(shape_spec, example_input))
+        if isinstance(example_input, list) and isinstance(shape_spec, (list, tuple)):
+            return [align_structure(spec, value) for spec, value in zip(shape_spec, example_input)]
+        return shape_spec
+
     sig_keys = list(inspect.signature(model.forward).parameters.keys())
     sig_key_set = set(sig_keys)
     ordered_inputs, ordered_shapes = {}, {}
-    for k in sig_keys:
-        if k in example_inputs:
-            ordered_inputs[k] = example_inputs[k]
-        if dynamic_shapes is not None and k in dynamic_shapes:
-            ordered_shapes[k] = dynamic_shapes[k]
-    reordered_inputs = {**ordered_inputs, **{k: v for k, v in example_inputs.items() if k not in sig_key_set}}
-    if dynamic_shapes is not None:
-        reordered_shapes = {**ordered_shapes, **{k: v for k, v in dynamic_shapes.items() if k not in sig_key_set}}
-        return reordered_inputs, reordered_shapes
-    return reordered_inputs, None
+    for key in sig_keys:
+        if key not in example_inputs:
+            continue
+        ordered_inputs[key] = example_inputs[key]
+        if dynamic_shapes is not None:
+            ordered_shapes[key] = align_structure(dynamic_shapes.get(key), example_inputs[key])
 
+    extra_inputs = {key: value for key, value in example_inputs.items() if key not in sig_key_set}
+    reordered_inputs = {**ordered_inputs, **extra_inputs}
+    if dynamic_shapes is not None:
+        extra_shapes = {
+            key: align_structure(dynamic_shapes.get(key), value) for key, value in extra_inputs.items()
+        }
+        return reordered_inputs, {**ordered_shapes, **extra_shapes}
+    return reordered_inputs, None
 
 def build_dynamo_export_kwargs(export_kwargs):
     """Prepare export kwargs for dynamo (torch.export) path.
@@ -89,7 +95,7 @@ def build_dynamo_export_kwargs(export_kwargs):
     from QEfficient.utils import constants
 
     kwargs = dict(export_kwargs)
-    kwargs.setdefault("report", False)
+    kwargs.setdefault("report", True)
     kwargs.setdefault("optimize", False)
     kwargs["dynamo"] = True
     kwargs["opset_version"] = constants.ONNX_DYNAMO_EXPORT_OPSET
@@ -114,13 +120,8 @@ def convert_dynamic_axes_to_dynamic_shapes(
         {"input_ids": {0: "batch_size", 1: "seq_len"},
          "past_key.0": {0: "batch_size", 2: "ctx_len"}, ...}
     model_config : optional
-        The HuggingFace model config object (model.config). Used to read:
-          - max_position_embeddings  -> upper bound for seq_len / ctx_len dims
-          - sliding_window           -> upper bound for sliding_window dim
-          - model_type               -> controls batch_min and whether
-                                       compressed_kvs reconstruction runs
-        When None, safe defaults are used for all bounds and model-type-specific
-        passes are skipped.
+        Retained for API compatibility. Dynamic dimensions are intentionally
+        unbounded and keyed only by their ONNX axis names.
 
     Returns
     -------
@@ -128,33 +129,11 @@ def convert_dynamic_axes_to_dynamic_shapes(
         torch.export dynamic_shapes dict with Dim objects, suitable for
         torch.onnx.export(dynamic_shapes=...).
     """
-    max_seq_len = getattr(model_config, "max_position_embeddings", 1024)
-    model_type = getattr(model_config, "model_type", None)
-    batch_min = 1 if model_type == "gpt_oss" else 2
-
     dim_registry: Dict[str, Any] = {}
 
     def resolve_dim(dim_name: str):
         if dim_name not in dim_registry:
-            if dim_name == "batch_size":
-                dim_registry[dim_name] = Dim("batch_size", min=batch_min, max=DYNAMO_DIM_MAX_BATCH_SIZE)
-            elif dim_name == "full_batch_size":
-                # CB pool capacity; different min prevents torch.export collapsing it with batch_size.
-                dim_registry[dim_name] = Dim("full_batch_size", min=batch_min + 1, max=DYNAMO_DIM_MAX_BATCH_SIZE)
-            elif "seq_len" in dim_name:
-                dim_registry[dim_name] = Dim("seq_len", min=2, max=max_seq_len)
-            elif "comp_ctx_lengths" in dim_name:
-                dim_registry[dim_name] = Dim("comp_ctx_lengths", min=DYNAMO_DIM_MIN_COMP_CTX_LENGTHS, max=max_seq_len)
-            elif "ctx_len" in dim_name:
-                dim_registry[dim_name] = Dim("ctx_len", min=2, max=max_seq_len)
-            elif "sliding_window" in dim_name:
-                dim_registry[dim_name] = Dim(
-                    "sliding_window",
-                    min=2,
-                    max=getattr(model_config, "sliding_window", max_seq_len),
-                )
-            else:
-                dim_registry[dim_name] = Dim.DYNAMIC
+            dim_registry[dim_name] = Dim(dim_name)
         return dim_registry[dim_name]
 
     dynamic_shapes: Dict[str, Any] = {}
@@ -195,7 +174,8 @@ def convert_dynamic_axes_to_dynamic_shapes(
         dynamic_shapes["compressed_kvs"] = [
             (compressed_kv_layers.get(i, {}), k_pe_layers.get(i, {})) for i in range(max_layer + 1)
         ]
-        
+
+
     if index_key_layers:
         dynamic_shapes["index_keys"] = [
             index_key_layers[layer_idx] for layer_idx in sorted(index_key_layers)

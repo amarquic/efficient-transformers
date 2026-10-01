@@ -572,6 +572,7 @@ def _find_transform_by_id(
         DtypeConversionCheckpointTransform,
         FusedExpertSplitCheckpointTransform,
         GptOssMxfp4ExpertDequantSplitCheckpointTransform,
+        MiniMaxGateUpCheckpointTransform,
         MoEExpertStackingCheckpointTransform,
     )
 
@@ -589,6 +590,7 @@ def _find_transform_by_id(
         "fused_expert_split_v1": FusedExpertSplitCheckpointTransform,
         "moe_fused_expert_split_v1": FusedExpertSplitCheckpointTransform,
         "granite_moe_fused_split_v1": FusedExpertSplitCheckpointTransform,
+        "minimax_gate_up_fusion_v1": MiniMaxGateUpCheckpointTransform,
         "dtype_conversion_v1": DtypeConversionCheckpointTransform,
     }
     return _ID_MAP.get(transform_id)

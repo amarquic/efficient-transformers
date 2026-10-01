@@ -95,10 +95,8 @@ def minimax_m3_clamped_glu_mlp(
     del b_g, b_u, b_d
     gate = x @ W_g
     up = x @ W_u
-    gate = torch.minimum(gate, torch.tensor(limit, dtype=gate.dtype, device=gate.device))
-    limit_tensor = torch.tensor(limit, dtype=up.dtype, device=up.device)
-    up = torch.maximum(up, -limit_tensor)
-    up = torch.minimum(up, limit_tensor)
+    gate = gate.clamp(max=limit)
+    up = up.clamp(min=-limit, max=limit)
     glu = gate * torch.sigmoid(gate * alpha)
     return ((up + 1.0) * glu) @ W_d
 

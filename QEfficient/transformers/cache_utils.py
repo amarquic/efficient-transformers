@@ -288,7 +288,7 @@ class QEffDynamicLayer(CacheLayerMixin):
         position_ids = cache_kwargs.get("position_ids")
         batch_index = cache_kwargs.get("batch_index", None)
         batch, num_kv_heads, _, _ = k_out.shape
-        ctx_indices = torch.arange(start=start_index, end=end_index)[None, None, ...]
+        ctx_indices = torch.arange(start=start_index, end=end_index, device=position_ids.device)[None, None, ...]
         gather_limit = position_ids.max(1, keepdim=True).values.unsqueeze(1)
         invalid_mask = ctx_indices > gather_limit
 
@@ -357,7 +357,7 @@ class QEffDynamicLayer(CacheLayerMixin):
             k_out = folded_cache
         T_block = end_index - start_index
 
-        ctx_indices = torch.arange(start=start_index, end=end_index)[None, None, ...]
+        ctx_indices = torch.arange(start=start_index, end=end_index, device=position_ids.device)[None, None, ...]
         gather_limit = position_ids.max(1, keepdim=True).values
         gather_limit = torch.cat([gather_limit] * Hkv, dim=1).reshape(1, -1, 1)
         invalid_mask = ctx_indices > gather_limit
@@ -393,7 +393,7 @@ class QEffDynamicLayer(CacheLayerMixin):
         position_ids = cache_kwargs.get("position_ids")
         batch_index = cache_kwargs.get("batch_index", None)
         batch, num_kv_heads, _, _ = v_out.shape
-        ctx_indices = torch.arange(start=start_index, end=end_index)[None, None, ...]
+        ctx_indices = torch.arange(start=start_index, end=end_index, device=position_ids.device)[None, None, ...]
         gather_limit = position_ids.max(1, keepdim=True).values.unsqueeze(1)
         invalid_mask = ctx_indices > gather_limit
 
@@ -439,7 +439,7 @@ class QEffDynamicLayer(CacheLayerMixin):
         else:
             v_out = folded_cache
         T_block = end_index - start_index
-        ctx_indices = torch.arange(start=start_index, end=end_index)[None, None, ...]
+        ctx_indices = torch.arange(start=start_index, end=end_index, device=position_ids.device)[None, None, ...]
         gather_limit = position_ids.max(1, keepdim=True).values
         gather_limit = torch.cat([gather_limit] * Hkv, dim=1).reshape(1, -1, 1)
         invalid_mask = ctx_indices > gather_limit
@@ -2069,7 +2069,7 @@ class QEffGPTOSSDynamicLayer(QEffDynamicLayer):
 
         batch, num_kv_heads, _, _ = k_out.shape
 
-        ctx_indices = torch.arange(start=start_idx, end=end_idx)[None, None, ...]
+        ctx_indices = torch.arange(start=start_idx, end=end_idx, device=position_ids.device)[None, None, ...]
         gather_limit = position_ids.max(1, keepdim=True).values.unsqueeze(1)
         invalid_mask = ctx_indices > gather_limit
         invalid_idx_value = InvalidIndexProvider._get_invalid_idx_value()
@@ -2097,7 +2097,7 @@ class QEffGPTOSSDynamicLayer(QEffDynamicLayer):
 
         batch, num_kv_heads, _, _ = v_out.shape
 
-        ctx_indices = torch.arange(start=start_idx, end=end_idx)[None, None, ...]
+        ctx_indices = torch.arange(start=start_idx, end=end_idx, device=position_ids.device)[None, None, ...]
         gather_limit = position_ids.max(1, keepdim=True).values.unsqueeze(1)
         invalid_mask = ctx_indices > gather_limit
         invalid_idx_value = InvalidIndexProvider._get_invalid_idx_value()

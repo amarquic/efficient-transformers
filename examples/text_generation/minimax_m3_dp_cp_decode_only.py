@@ -12,11 +12,11 @@ import tempfile
 import time
 
 import torch
-from transformers import AutoConfig, AutoProcessor, AutoTokenizer, AutoModelForImageTextToText
+from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor, AutoTokenizer
 
 from QEfficient import QEFFAutoModelForImageTextToText
 
-MODEL_ID = "MiniMaxAI/MiniMax-M3"
+MODEL_ID = "/home/amarshar/minimax-tiny"
 
 
 def _expand_batch(inputs, batch_size: int):
@@ -47,7 +47,6 @@ def _run_pytorch_parity_test(
     msa_indexer_dp: int = 1,
     msa_indexer_cp: int = 1,
     msa_attn_dp: int = 1,
-    msa_attn_cp: int = 1,
     indexer_n_head: int = 1,
     num_cores_per_device: int = 16,
     batch_size: int = 1,
@@ -86,29 +85,28 @@ def _run_pytorch_parity_test(
             "tree_reduce": tree_reduce,
         }
     }
-    if msa_indexer_dp > 1 or msa_attn_dp > 1 or msa_attn_cp > 1:
-        qaic_config["blocking_mode"] = "kv_headpar"
+    if msa_indexer_dp > 1 or msa_attn_dp > 1:
+        qaic_config["blocking_mode"] = "kv_batch_fold"
         qaic_config["num_kv_blocks"] = 2
         if msa_indexer_dp > 1 or msa_indexer_cp > 1:
             qaic_config["msa_indexer_dp"] = msa_indexer_dp
             qaic_config["msa_indexer_cp"] = msa_indexer_cp
             qaic_config["indexer_n_head"] = indexer_n_head
             qaic_config["num_cores_per_device"] = num_cores_per_device
-        if msa_attn_dp > 1 or msa_attn_cp > 1:
-            qaic_config["msa_attn_cp"] = msa_attn_cp
+        if msa_attn_dp > 1:
             qaic_config["msa_attn_dp"] = msa_attn_dp
 
-    qeff_model = QEFFAutoModelForImageTextToText.from_pretrained(model_dir, torch_dtype=torch.float32)
+    qeff_model = QEFFAutoModelForImageTextToText.from_pretrained(model_dir, weight_free=True, torch_dtype=torch.float32)
     qeff_model.compile(
         batch_size=execution_batch_size,
         prefill_seq_len=1,
-        prefill_only=False,
         ctx_len=ctx_len,
         num_cores=num_cores,
         num_devices=num_devices,
         use_onnx_subfunctions=False,
         skip_vision=True,
         node_precision_info=True,
+        dynamo=True,
         offload_pt_weights=False,
         weight_free=False,
         qaic_config=qaic_config,
@@ -128,10 +126,10 @@ def _run_pytorch_parity_test(
 def main():
     parser = argparse.ArgumentParser(description="MiniMax-M3 text-only decode (PL=1) with DP and GP enabled.")
     parser.add_argument("--model-id", default=MODEL_ID)
-    parser.add_argument("--ctx-len", type=int, default=4096)
+    parser.add_argument("--ctx-len", type=int, default=65536)
     parser.add_argument("--num-devices", type=int, default=16)
     parser.add_argument("--num-cores", type=int, default=16)
-    parser.add_argument("--generation-len", type=int, default=32)
+    parser.add_argument("--generation-len", type=int, default=250)
     parser.add_argument(
         "--batch-size",
         type=int,
@@ -179,12 +177,6 @@ def main():
         help="DP factor for GP attention (_baseline_attention_gp path). Must divide batch_size.",
     )
     parser.add_argument(
-        "--msa-attn-cp",
-        type=int,
-        default=1,
-        help="CP factor for GP attention cache layout.",
-    )
-    parser.add_argument(
         "--indexer-n-head",
         type=int,
         default=1,
@@ -221,7 +213,6 @@ def main():
                 msa_indexer_dp=args.msa_indexer_dp,
                 msa_indexer_cp=args.msa_indexer_cp,
                 msa_attn_dp=args.msa_attn_dp,
-                msa_attn_cp=args.msa_attn_cp,
                 indexer_n_head=args.indexer_n_head,
                 num_cores_per_device=args.num_cores_per_device,
                 batch_size=args.batch_size,
@@ -235,31 +226,30 @@ def main():
     factory_kwargs["config"] = config
 
     t0 = time.perf_counter()
-    qeff_model = QEFFAutoModelForImageTextToText.from_pretrained(args.model_id, **factory_kwargs)
+    qeff_model = QEFFAutoModelForImageTextToText.from_pretrained(args.model_id, weight_free=True, **factory_kwargs)
     print(f"[timing] model load:          {time.perf_counter() - t0:.2f}s")
 
     t0 = time.perf_counter()
     qpc_paths = qeff_model.compile(
         batch_size=execution_batch_size,
         prefill_seq_len=1,
-        prefill_only=False,
         ctx_len=args.ctx_len,
         num_cores=args.num_cores,
         num_devices=args.num_devices,
         mxfp6_matmul=True,
         mxint8_kv_cache=True,
-        use_onnx_subfunctions=True,
+        use_onnx_subfunctions=False,
         skip_vision=True,
-        node_precision_info=True,
+        node_precision_info=False,
         offload_pt_weights=False,
+        dynamo=True,
         log_times=True,
         qaic_config={
-            "blocking_mode": "kv_headpar",
+            "blocking_mode": "kv_batch_fold",
             "num_kv_blocks": 2,
             "msa_indexer_dp": args.msa_indexer_dp,
             "msa_indexer_cp": args.msa_indexer_cp,
             "msa_attn_dp": args.msa_attn_dp,
-            "msa_attn_cp": args.msa_attn_cp,
             "indexer_n_head": args.indexer_n_head,
             "num_cores_per_device": args.num_cores_per_device,
             "moe_config": {
@@ -296,7 +286,8 @@ def main():
     )
     inputs = _expand_batch(inputs, execution_batch_size)
     t0 = time.perf_counter()
-    output = qeff_model.generate(inputs=inputs, generation_len=args.generation_len)
+    #device_ids = list(range(16))
+    output = qeff_model.generate(inputs=inputs, generation_len=args.generation_len,enable_debug_logs =True)
     generate_time = time.perf_counter() - t0
 
     num_generated = output.generated_ids.shape[-1]

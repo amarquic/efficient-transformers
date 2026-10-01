@@ -135,11 +135,14 @@ def find_checkpoint_key(
     if key is not None:
         return key
 
-    # 2. Transform-specific explicit mapping
-    if active_transform is not None and hasattr(active_transform, "resolve_onnx_key"):
-        key = active_transform.resolve_onnx_key(onnx_name, checkpoint_index)
-        if key is not None:
-            return key
+    # 2. Transform-specific explicit mappings. The prepared checkpoint may use
+    # one layout transform plus independent model-specific transforms.
+    resolver_transforms = active_transform if isinstance(active_transform, (list, tuple)) else [active_transform]
+    for transform in resolver_transforms:
+        if transform is not None and hasattr(transform, "resolve_onnx_key"):
+            key = transform.resolve_onnx_key(onnx_name, checkpoint_index)
+            if key is not None:
+                return key
 
     # 3. Legacy MoE weight aliases (kept for old prepared checkpoints)
     return _find_checkpoint_key(
@@ -201,22 +204,26 @@ def promote_initializers_and_build_spec(onnx_program, model_ref: str, model_name
         _find_transform_by_id,
     )
 
-    active_transform = None
+    active_transform = []
     manifest_path = Path(model_ref) / CHECKPOINT_PREPARED_MANIFEST
     if manifest_path.exists():
         try:
             manifest = json.loads(manifest_path.read_text())
-            transform_id = manifest.get("active_group", "none")
-            if transform_id and transform_id != "none":
-                active_transform = _find_transform_by_id(
+            transform_ids = list(manifest.get("plan", {}).get("transform_ids", []))
+            active_group_id = manifest.get("active_group", "none")
+            if active_group_id and active_group_id != "none" and active_group_id not in transform_ids:
+                transform_ids.insert(0, active_group_id)
+            for transform_id in transform_ids:
+                transform = _find_transform_by_id(
                     transform_id,
                     getattr(qeff_model, "_checkpoint_transforms", []),
                 )
+                if transform is not None and transform not in active_transform:
+                    active_transform.append(transform)
         except (OSError, json.JSONDecodeError):
-            pass  # no manifest → active_transform stays None, fallback to legacy aliases
+            pass  # no manifest → resolver list stays empty, fallback to legacy aliases
 
     promoted_inputs: List[WeightSpecInput] = []
-
     for name, init_value in list(model_ir.graph.initializers.items()):
         if name not in model_names:
             continue

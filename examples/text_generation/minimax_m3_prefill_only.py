@@ -253,6 +253,7 @@ def main():
         config=config,
         kv_offload=True,
         dtype=torch.float16,
+        weight_free=True,
     )
     print(f"[timing] model load: {time.perf_counter() - load_start:.2f}s")
 
@@ -271,7 +272,7 @@ def main():
         use_onnx_subfunctions=True,
         skip_vision=True,
         offload_pt_weights=False,
-        node_precision_info=True,
+        node_precision_info=False,
         log_times=True,
         retain_full_kv=True,
         split_model_io=True,

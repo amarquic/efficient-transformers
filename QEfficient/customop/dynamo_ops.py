@@ -91,7 +91,7 @@ def _(data: torch.Tensor, ctx_indices: torch.Tensor) -> torch.Tensor:
     # Return tensor with shape [batch_size, seq_len]
     batch_size = data.shape[0]
     seq_len = ctx_indices.shape[1]
-    return torch.empty(batch_size, seq_len, dtype=data.dtype, device=data.device)
+    return torch.empty(batch_size, seq_len, data.shape[2], dtype=data.dtype, device=data.device)
 
 
 @torch.library.custom_op("qefficient::ctx_gather", mutates_args=())

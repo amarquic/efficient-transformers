@@ -409,6 +409,121 @@ class FusedExpertSplitCheckpointTransform(BaseCheckpointTransform):
 
 
 # ---------------------------------------------------------------------------
+# MiniMax dense/shared-expert gate+up fusion
+# ---------------------------------------------------------------------------
+
+
+class MiniMaxGateUpCheckpointTransform(BaseCheckpointTransform):
+    """Prepare and resolve MiniMax checkpoint weights for weight-free export."""
+
+    TRANSFORM_ID = "minimax_gate_up_fusion_v1"
+    _PROJECTION_RE = re.compile(
+        r"^(.+\.layers\.\d+\.(?:mlp|block_sparse_moe\.shared_experts))\.(gate_proj|up_proj)\.weight$"
+    )
+    _INDEXER_RE = re.compile(r"\.indexer\.(q_proj|k_proj|q_norm|k_norm)\.weight$")
+
+    @classmethod
+    def is_applicable(cls, weight_map: Dict[str, str], config=None, **kwargs) -> bool:
+        model_types = {
+            getattr(config, "model_type", None),
+            getattr(getattr(config, "text_config", None), "model_type", None),
+        }
+        return bool({"minimax_m3_vl", "minimax_m3_vl_text"} & model_types) and any(
+            cls._PROJECTION_RE.match(key) for key in weight_map
+        )
+
+    @classmethod
+    def resolve_onnx_key(cls, onnx_key: str, checkpoint_index: Dict[str, str]) -> Optional[str]:
+        """Map MiniMax's exported module paths to published checkpoint paths."""
+        stripped = onnx_key.removeprefix("base_model.")
+        candidates = []
+
+        language_match = re.search(r"^(.*?)model\.language_model\.(.*)$", stripped)
+        swapped = f"language_model.model.{language_match.group(2)}" if language_match else None
+        short_language_match = re.match(r"^language_model\.(?!model\.)(.*)$", stripped)
+        prefixed = f"language_model.model.{short_language_match.group(1)}" if short_language_match else None
+
+        for base in (stripped, swapped, prefixed):
+            if base is None:
+                continue
+            variants = [base]
+            if ".mlp." in base:
+                variants.append(base.replace(".mlp.", ".block_sparse_moe."))
+
+            for variant in variants:
+                candidates.append(variant)
+                flattened = cls._INDEXER_RE.sub(r".index_\1.weight", variant)
+                if flattened != variant:
+                    candidates.append(flattened)
+                if variant.endswith(".gate.e_score_correction_bias"):
+                    candidates.append(
+                        variant[: -len(".gate.e_score_correction_bias")] + ".e_score_correction_bias"
+                    )
+
+            if base.endswith(".mlp.gate.weight"):
+                candidates.append(base[: -len(".gate.weight")] + ".router.weight")
+            if base.endswith(".mlp.router.weight"):
+                candidates.append(base[: -len(".router.weight")] + ".gate.weight")
+
+        if stripped == "lm_head.weight" or stripped.endswith(".lm_head.weight"):
+            candidates.append("language_model.lm_head.weight")
+
+        matches = list(dict.fromkeys(candidate for candidate in candidates if candidate in checkpoint_index))
+        if len(matches) > 1:
+            raise ValueError(f"Ambiguous MiniMax checkpoint key for ONNX initializer '{onnx_key}': {matches}.")
+        return matches[0] if matches else None
+
+    @classmethod
+    def plan_tasks(cls, context: CheckpointPlanningContext) -> None:
+        pairs: Dict[str, Dict[str, str]] = {}
+        for key in context.weight_map:
+            match = cls._PROJECTION_RE.match(key)
+            if match:
+                pairs.setdefault(match.group(1), {})[match.group(2)] = key
+
+        for group_index, (prefix, projections) in enumerate(sorted(pairs.items())):
+            missing = {"gate_proj", "up_proj"} - set(projections)
+            if missing:
+                raise ValueError(f"MiniMax projection group {prefix} is missing keys: {sorted(missing)}")
+
+            gate_key = projections["gate_proj"]
+            up_key = projections["up_proj"]
+            input_refs = _task_refs((gate_key, up_key))
+            output_ref = TensorRef(f"{prefix}.gate_up_proj.weight", "fused")
+            output_file = f"minimax-gate-up-{group_index:05d}.safetensors"
+
+            def runner(get_tensor, target_dtype, gate_key=gate_key, up_key=up_key, output_ref=output_ref):
+                gate = get_tensor(TensorRef(gate_key, "raw"))
+                up = get_tensor(TensorRef(up_key, "raw"))
+                return {output_ref: torch.cat((gate, up), dim=0).contiguous()}
+
+            task_plan = CheckpointTaskPlan(
+                task_id=f"{cls.TRANSFORM_ID}:{prefix}",
+                input_refs=input_refs,
+                source_files=tuple(sorted({context.weight_map[gate_key], context.weight_map[up_key]})),
+                output_file=output_file,
+                estimated_peak_bytes=_estimate_task_bytes(
+                    context.source_dir,
+                    context.weight_map,
+                    (gate_key, up_key),
+                    context.target_dtype,
+                ),
+                params=TaskParams(cls.TRANSFORM_ID, _task_values(prefix=prefix, output_file=output_file)),
+            )
+            task_plan.append_stage(
+                CheckpointStage(
+                    stage_id="minimax_gate_up_fusion",
+                    input_refs=input_refs,
+                    output_refs=(output_ref,),
+                    params=TaskParams(cls.TRANSFORM_ID, _task_values(prefix=prefix)),
+                    runner=runner,
+                    labels=("fuse_gate_up",),
+                )
+            )
+            context.add_task_plan(task_plan)
+
+
+# ---------------------------------------------------------------------------
 # Independent stage transforms and task planning
 # ---------------------------------------------------------------------------
 

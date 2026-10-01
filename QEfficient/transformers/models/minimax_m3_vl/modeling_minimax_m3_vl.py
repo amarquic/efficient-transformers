@@ -47,11 +47,13 @@ from QEfficient.blocking.attention_blocking import (
 from QEfficient.customop.utils import (
     ctx_gather_3d,
     ctx_gather_block_range_kv_dp,
+    ctx_gather_blocked_kv,
     ctx_gather_blocked_kv_dp,
     ctx_paged_scatter_dp,
     ctx_scatter_3d,
+    m3_ctx_scatter,
 )
-from QEfficient.customop import CtxGatherFuncBlockedKV, CtxGatherFuncPagedKVDP, CtxPagedScatterFuncDP, M3CtxScatterFunc
+from QEfficient.customop import CtxGatherFuncPagedKVDP
 
 from QEfficient.transformers.modeling_attn_mask_utils import _create_causal_mask
 from QEfficient.transformers.moe import (
@@ -69,6 +71,23 @@ from QEfficient.utils.constants import MIN_MASKED_ATTENTION_VALUE
 
 MASKED_ATTENTION_LOGIT = -3.0e4
 _FP16_MAX_VALUE = 65504.0
+
+
+def _sign_free_floor_div(values: torch.Tensor, divisor: int) -> torch.Tensor:
+    """Floor-divide non-negative values without exporting an integer Sign operation."""
+    dtype = values.dtype
+    values = values.clamp_min(0).to(torch.float32)
+    return torch.floor(values / float(divisor)).to(dtype)
+
+
+def _is_dynamo_compiling() -> bool:
+    dynamo = getattr(torch, "_dynamo", None)
+    if dynamo is None:
+        return False
+    try:
+        return bool(dynamo.is_compiling())
+    except Exception:
+        return False
 
 
 _MINIMAX_NPI_OUTPUT_SUFFIXES = (
@@ -210,9 +229,15 @@ def qeff_apply_rotary_pos_emb(
     return torch.cat((rotated_q, passthrough_q), dim=-1), torch.cat((rotated_k, passthrough_k), dim=-1)
 
 
-def _scalar_like(reference: torch.Tensor, value: int | float) -> torch.Tensor:
-    """Create a scalar constant without materializing ``reference.shape``."""
-    return torch.tensor(value, dtype=reference.dtype, device=reference.device)
+def _scalar_like(reference: torch.Tensor, value: int | float) -> int | float:
+    """Return a scalar whose tensor operand determines dtype and device.
+
+    Materializing this value on ``reference.device`` creates a dataless meta
+    initializer during weight-free export. Torch's scalar overloads preserve
+    the dtype and device of the other tensor operand without lifting a tensor.
+    """
+    del reference
+    return value
 
 
 class QEffMiniMaxM3VLRotaryEmbedding(MiniMaxM3VLRotaryEmbedding):
@@ -231,7 +256,7 @@ class QEffMiniMaxM3VLRotaryEmbedding(MiniMaxM3VLRotaryEmbedding):
         self._set_cos_sin_cache(
             seq_len=int(self.original_max_seq_len),
             device=self.inv_freq.device,
-            dtype=torch.get_default_dtype(),
+            dtype=getattr(self.config, "dtype", None) or torch.get_default_dtype(),
         )
 
     def _set_cos_sin_cache(self, seq_len: int, device, dtype):
@@ -508,7 +533,7 @@ class QEffMiniMaxM3VLIndexer(MiniMaxM3VLIndexer):
         invalid = offsets > position_max[:, :, None]
         invalid_value = torch.iinfo(torch.int32).max if torch.onnx.is_in_onnx_export() else 0
         offsets = torch.where(invalid, _scalar_like(offsets, invalid_value), offsets)
-        gathered = CtxGatherFuncBlockedKV.apply(index_key_cache, offsets.reshape(batch_local, 1, block_len))
+        gathered = ctx_gather_blocked_kv(index_key_cache, offsets.reshape(batch_local, 1, block_len))
         return gathered.reshape(batch_local, num_cores, tokens_per_core, head_dim)
 
     def _write_msa_paged_prefill_cache(
@@ -536,7 +561,7 @@ class QEffMiniMaxM3VLIndexer(MiniMaxM3VLIndexer):
         physical_page = torch.gather(block_table[0].to(torch.int64), 1, logical_page).to(torch.int32)
         block_ids = physical_page.unsqueeze(1).expand(batch, rows, query_len)
         addresses = (position_ids % page_size).to(torch.int32).unsqueeze(1).expand_as(block_ids)
-        return CtxPagedScatterFuncDP.apply(cache, block_ids, addresses, updates)
+        return ctx_paged_scatter_dp(cache, block_ids, addresses, updates)
 
     def _read_msa_prefill_paged_block(
         self,
@@ -707,7 +732,7 @@ class QEffMiniMaxM3VLIndexer(MiniMaxM3VLIndexer):
         idx_q = self._apply_rope(idx_q, cos, sin)
         idx_k = self._apply_rope(idx_k, cos, sin)
         if paged_block_table is None:
-            index_key_cache = M3CtxScatterFunc.apply(index_key_cache, position_ids.to(torch.int32), idx_k)
+            index_key_cache = m3_ctx_scatter(index_key_cache, position_ids.to(torch.int32), idx_k)
         else:
             index_key_cache = self._write_msa_paged_prefill_cache(
                 index_key_cache,
@@ -765,12 +790,12 @@ class QEffMiniMaxM3VLIndexer(MiniMaxM3VLIndexer):
             q_blocks = nested_q_blocks[q_chunk_idx]
             query_position_blocks = nested_position_blocks[q_chunk_idx]
             q_chunk_position = query_positions.max(dim=-1).values
-            is_export = torch.onnx.is_in_onnx_export() or torch.jit.is_tracing()
+            is_export = torch.onnx.is_in_onnx_export() or torch.jit.is_tracing() or _is_dynamo_compiling()
 
             for block_idx in range(num_kv_blocks):
                 start = block_idx * kv_block_size
                 end = start + kv_block_size
-                block_skip_future_chunk = torch.tensor(start, device=hidden_states.device) > q_chunk_position
+                block_skip_future_chunk = start > q_chunk_position
                 if skip_kv and not is_export and bool(block_skip_future_chunk.all().item()):
                     # Keep one reduced score tensor per skipped indexer KV
                     # block.  The block is entirely future, so the score
@@ -844,9 +869,7 @@ class QEffMiniMaxM3VLIndexer(MiniMaxM3VLIndexer):
                         q_core.float(),
                         key_core.transpose(-1, -2).float(),
                     )
-                    block_skip_future = (
-                        torch.tensor(start, device=hidden_states.device) > q_positions[:, None, None, :, None]
-                    )
+                    block_skip_future = start > q_positions[:, None, None, :, None]
                     if skip_kv:
                         scores = torch.where(
                             block_skip_future,
@@ -893,16 +916,14 @@ class QEffMiniMaxM3VLIndexer(MiniMaxM3VLIndexer):
                 scores = scores.permute(0, 1, 4, 2, 3, 5).reshape(batch, num_index_heads, -1, num_blocks)
                 q_positions = query_position_blocks[q_block_idx]
                 block_ids = torch.arange(num_blocks, device=hidden_states.device).view(1, 1, 1, num_blocks)
-                mask_score = torch.tensor(mask_value, dtype=scores.dtype, device=scores.device)
-                local_score = torch.tensor(-mask_value, dtype=scores.dtype, device=scores.device)
                 block_skip_future = block_ids * index_block_size > q_positions[:, None, :, None]
                 scores = torch.where(
                     block_skip_future,
-                    mask_score,
+                    mask_value,
                     scores,
                 )
                 for local_offset in range(cfg.index_local_blocks):
-                    local_block = q_positions // index_block_size - local_offset
+                    local_block = _sign_free_floor_div(q_positions, index_block_size) - local_offset
                     local_block = torch.where(
                         local_block >= 0,
                         local_block,
@@ -910,7 +931,7 @@ class QEffMiniMaxM3VLIndexer(MiniMaxM3VLIndexer):
                     )
                     scores = torch.where(
                         block_ids == local_block[:, None, :, None],
-                        local_score,
+                        -mask_value,
                         scores,
                     )
                 top_scores, top_order = torch.topk(scores, k=topk, dim=-1)
@@ -1190,7 +1211,7 @@ class QEffMiniMaxM3VLIndexer(MiniMaxM3VLIndexer):
         block_id = torch.where(row_live, block_id_dp, torch.iinfo(torch.int32).max).reshape(
             batch_local, rows, query_len
         )
-        index_key_cache = CtxPagedScatterFuncDP.apply(index_key_cache, block_id, addr, k_updates)
+        index_key_cache = ctx_paged_scatter_dp(index_key_cache, block_id, addr, k_updates)
 
         q_heads_per_kv = num_index_heads // hkv
         ql_eff = q_heads_per_kv * query_len
@@ -1569,14 +1590,13 @@ class QEffMiniMaxM3VLIndexer(MiniMaxM3VLIndexer):
                 block_ranges.append((start, end))
                 block_starts.append(start)
 
+        block_starts_tensor = (
+            torch.arange(len(block_starts), device=hidden_states.device, dtype=q_pos_rows_all.dtype)
+            * cache_block_size
+        )
         q_pos_shift_all = (
             q_pos_rows_all[:, None, :, None, None]
-            - torch.tensor(
-                block_starts,
-                device=hidden_states.device,
-                dtype=q_pos_rows_all.dtype,
-            ).view(1, len(block_starts), 1, 1, 1)
-            * cp
+            - block_starts_tensor.view(1, len(block_starts), 1, 1, 1) * cp
         )
         causal_masks: list[torch.Tensor] = []
         for block_idx in range(len(block_ranges)):
@@ -1854,7 +1874,7 @@ class QEffMiniMaxM3VLIndexer(MiniMaxM3VLIndexer):
         idx_q = self._apply_rope(idx_q, cos, sin)
         idx_k = self._apply_rope(idx_k, cos, sin)
         if paged_block_table is None:
-            index_key_cache = M3CtxScatterFunc.apply(index_key_cache, position_ids.to(torch.int32), idx_k)
+            index_key_cache = m3_ctx_scatter(index_key_cache, position_ids.to(torch.int32), idx_k)
         else:
             index_key_cache = self._write_msa_paged_prefill_cache(
                 index_key_cache,
@@ -1901,12 +1921,12 @@ class QEffMiniMaxM3VLIndexer(MiniMaxM3VLIndexer):
             q_blocks = nested_q_blocks[q_chunk_idx]
             query_position_blocks = nested_position_blocks[q_chunk_idx]
             q_chunk_position = query_positions.max(dim=-1).values
-            is_export = torch.onnx.is_in_onnx_export() or torch.jit.is_tracing()
+            is_export = torch.onnx.is_in_onnx_export() or torch.jit.is_tracing() or _is_dynamo_compiling()
 
             for block_idx in range(num_kv_blocks):
                 start = block_idx * kv_block_size
                 end = start + kv_block_size
-                block_skip_future_chunk = torch.tensor(start, device=hidden_states.device) > q_chunk_position
+                block_skip_future_chunk = start > q_chunk_position
                 if blocking_config.skip_kv and not is_export and bool(block_skip_future_chunk.all().item()):
                     # The remaining context blocks are entirely in the
                     # future for every query in this Q chunk.  Selection
@@ -2003,7 +2023,7 @@ class QEffMiniMaxM3VLIndexer(MiniMaxM3VLIndexer):
                         scores,
                     )
                 for local_offset in range(cfg.index_local_blocks):
-                    local_block = q_positions // index_block_size - local_offset
+                    local_block = _sign_free_floor_div(q_positions, index_block_size) - local_offset
                     local_block = torch.where(
                         local_block >= 0,
                         local_block,
@@ -2092,8 +2112,8 @@ class QEffMiniMaxM3VLAttention(MiniMaxM3VLAttention):
             int(cfg.head_dim * cfg.rope_parameters.get("partial_rotary_factor", 1.0)),
         )
         if paged_block_table is None:
-            key_cache = M3CtxScatterFunc.apply(key_cache, position_ids.to(torch.int32), k)
-            value_cache = M3CtxScatterFunc.apply(value_cache, position_ids.to(torch.int32), v)
+            key_cache = m3_ctx_scatter(key_cache, position_ids.to(torch.int32), k)
+            value_cache = m3_ctx_scatter(value_cache, position_ids.to(torch.int32), v)
         else:
             if (getattr(blocking_config, "msa_attn_dp", 1) or 1) != 1 or (
                 getattr(blocking_config, "msa_attn_cp", 1) or 1
@@ -2123,8 +2143,8 @@ class QEffMiniMaxM3VLAttention(MiniMaxM3VLAttention):
             physical_page = torch.gather(paged_block_table.to(torch.int64), 1, logical_page).to(torch.int32)
             block_ids = physical_page.unsqueeze(1).expand(batch, num_kv_heads, query_len)
             addresses = (position_ids % page_size).to(torch.int32).unsqueeze(1).expand_as(block_ids)
-            key_cache = CtxPagedScatterFuncDP.apply(key_cache, block_ids, addresses, k)
-            value_cache = CtxPagedScatterFuncDP.apply(value_cache, block_ids, addresses, v)
+            key_cache = ctx_paged_scatter_dp(key_cache, block_ids, addresses, k)
+            value_cache = ctx_paged_scatter_dp(value_cache, block_ids, addresses, v)
 
         q = q.reshape(batch, num_kv_heads, n_rep, query_len, cfg.head_dim)
         offsets = torch.arange(block_size, device=hidden_states.device).view(1, 1, 1, 1, 1, block_size)
@@ -2310,7 +2330,7 @@ class QEffMiniMaxM3VLAttention(MiniMaxM3VLAttention):
 
                 if paged_block_table is None:
                     key_block = (
-                        CtxGatherFuncBlockedKV.apply(key_cache, gather_positions)
+                        ctx_gather_blocked_kv(key_cache, gather_positions)
                         .reshape(
                             batch,
                             num_kv_heads,
@@ -2329,7 +2349,7 @@ class QEffMiniMaxM3VLAttention(MiniMaxM3VLAttention):
                         .float()
                     )
                     value_block = (
-                        CtxGatherFuncBlockedKV.apply(value_cache, gather_positions)
+                        ctx_gather_blocked_kv(value_cache, gather_positions)
                         .reshape(
                             batch,
                             num_kv_heads,
@@ -3140,13 +3160,13 @@ class QEffMiniMaxM3VLAttention(MiniMaxM3VLAttention):
                     .expand(batch_local, attn_dp, self.config.num_key_value_heads, attn_cp, -1, self.head_dim)
                     .reshape(batch_local, attn_dp * self.config.num_key_value_heads * attn_cp, -1, self.head_dim)
                 )
-                layer.keys = CtxPagedScatterFuncDP.apply(
+                layer.keys = ctx_paged_scatter_dp(
                     key_cache,
                     block_id.reshape(batch_local, -1, key_states.shape[2]).to(torch.int32),
                     addr.reshape(batch_local, -1, key_states.shape[2]),
                     updates_k,
                 )
-                layer.values = CtxPagedScatterFuncDP.apply(
+                layer.values = ctx_paged_scatter_dp(
                     value_cache,
                     block_id.reshape(batch_local, -1, key_states.shape[2]).to(torch.int32),
                     addr.reshape(batch_local, -1, key_states.shape[2]),
@@ -3262,13 +3282,10 @@ class QEffMiniMaxM3VLAttention(MiniMaxM3VLAttention):
 
 
 def _qeff_minimax_clamp(hidden_states: torch.Tensor, min_value=None, max_value=None) -> torch.Tensor:
-    if min_value is not None:
-        min_tensor = torch.tensor(min_value, dtype=hidden_states.dtype, device=hidden_states.device)
-        hidden_states = torch.maximum(hidden_states, min_tensor)
-    if max_value is not None:
-        max_tensor = torch.tensor(max_value, dtype=hidden_states.dtype, device=hidden_states.device)
-        hidden_states = torch.minimum(hidden_states, max_tensor)
-    return hidden_states
+    # Python scalar bounds lower to ONNX constants. Constructing bounds on
+    # hidden_states.device creates dataless meta initializers in weight-free
+    # export, which cannot be serialized.
+    return hidden_states.clamp(min=min_value, max=max_value)
 
 
 class QEffMiniMaxM3VLDenseMLP(MiniMaxM3VLDenseMLP):
@@ -3286,7 +3303,7 @@ class QEffMiniMaxM3VLTopKRouter(MiniMaxM3VLTopKRouter):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
         router_logits = nn.functional.linear(hidden_states.to(self.weight.dtype), self.weight)
         routing_weights = nn.functional.sigmoid(router_logits.float())
-        scores_for_choice = routing_weights + self.e_score_correction_bias
+        scores_for_choice = routing_weights + self.e_score_correction_bias.to(device=routing_weights.device)
         _, top_k_index = torch.topk(scores_for_choice, self.top_k, dim=1, sorted=False)
         top_k_weights = routing_weights.gather(1, top_k_index)
         denom = torch.einsum("tk->t", top_k_weights)
@@ -3372,10 +3389,7 @@ class QEffMiniMaxM3VLTextModel(MiniMaxM3VLTextModel):
         # Hoist pre-scaled RoPE tables onto the text model as parameters.  This
         # exports them as graph initializers, matching the established QEff
         # Llama/Qwen path, instead of Constant nodes inside rotary_emb.
-        rotary_emb = QEffMiniMaxM3VLRotaryEmbedding(
-            config=self.config,
-            device=self.embed_tokens.weight.device,
-        )
+        rotary_emb = QEffMiniMaxM3VLRotaryEmbedding(config=self.config)
         self.cos_cached = nn.Parameter(rotary_emb.cos_cached.contiguous(), requires_grad=False)
         self.sin_cached = nn.Parameter(rotary_emb.sin_cached.contiguous(), requires_grad=False)
         # The exported forward gathers from the model-level tables directly.
@@ -3453,7 +3467,7 @@ class QEffMiniMaxM3VLTextModel(MiniMaxM3VLTextModel):
                 indexer_sin = indexer_sin.view(
                     indexer_dp, batch_local, indexer_sin.shape[1], indexer_sin.shape[-1]
                 ).permute(1, 0, 2, 3)
-            indexer_position_embeddings = (indexer_cos, indexer_sin)
+            indexer_position_embeddings = (indexer_cos.clone(), indexer_sin.clone())
         for decoder_layer in self.layers:
             hidden_states = decoder_layer(
                 hidden_states,
@@ -3541,7 +3555,7 @@ class QEffMiniMaxM3VLEncoderWrapper(nn.Module):
             image_embeds = torch.cat(image_embeds, dim=0)
         image_embeds = image_embeds.to(pixel_values.device, pixel_values.dtype)
         bs = image_grid_thw.shape[0]
-        split_size = torch.floor_divide(torch.tensor(image_embeds.size(0), device=image_embeds.device), bs)
+        split_size = image_embeds.shape[0] // bs
         image_embeds = image_embeds.reshape(bs, split_size, image_embeds.size(-1))
         return image_embeds
 
@@ -3602,9 +3616,8 @@ class QEffMiniMaxM3VLDecoderWrapper(nn.Module):
             indices1 = torch.where(indices1 != -1, indices1 + image_idx, indices1)
             image_features_expanded = vision_embeds.reshape(-1, hidden_dim)[indices1]
             image_input_embeds = torch.where(selected.unsqueeze(-1), image_features_expanded, inputs_embeds)
-            inputs_embeds = torch.where(
-                input_ids.shape[1] == torch.tensor(1, device=input_ids.device), inputs_embeds, image_input_embeds
-            )
+            seq_len = torch.scalar_tensor(input_ids.shape[1], dtype=torch.int64, device=input_ids.device)
+            inputs_embeds = torch.where(seq_len == 1, inputs_embeds, image_input_embeds)
             image_idx_output = (indices1.max() + 1).unsqueeze(0).unsqueeze(0)
         else:
             if image_idx is None:
@@ -3642,7 +3655,7 @@ class QEffMiniMaxM3VLDecoderWrapper(nn.Module):
             past_kv_out = tuple((t[0], t[1]) for t in result_cache)
             index_keys_out = tuple(t[2] for t in result_cache if len(t) == 3)
 
-        return logits, vision_embeds, image_idx_output, past_kv_out, index_keys_out
+        return logits, vision_embeds.clone(), image_idx_output, past_kv_out, index_keys_out
 
 
 class QEffMiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForConditionalGeneration):
@@ -3716,9 +3729,8 @@ class QEffMiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForConditionalG
         indices0 = torch.arange(selected.shape[0], device=selected.device).view(-1, 1)
         image_features_expanded = image_features.reshape(-1, hidden_dim).unsqueeze(0)[indices0, indices1]
         image_input_embeds = torch.where(selected.unsqueeze(-1), image_features_expanded, inputs_embeds)
-        inputs_embeds = torch.where(
-            input_ids.shape[1] == torch.tensor(1, device=input_ids.device), inputs_embeds, image_input_embeds
-        )
+        seq_len = torch.scalar_tensor(input_ids.shape[1], dtype=torch.int64, device=input_ids.device)
+        inputs_embeds = torch.where(seq_len == 1, inputs_embeds, image_input_embeds)
 
         if past_key_values is not None and not isinstance(past_key_values, Cache):
             past_key_values = QEffDynamicCache.from_legacy_cache(past_key_values)
@@ -3805,10 +3817,12 @@ class QEffMiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForConditionalG
         continuous_batching: bool = False,
         kv_cache_batch_size: Optional[int] = None,
         full_batch_size: Optional[int] = None,
+        vision_batch_size: Optional[int] = None,
         **compiler_options,
     ):
         prefill_seq_len = prefill_seq_len if prefill_seq_len else constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN
         ctx_len = ctx_len if ctx_len else constants.ONNX_EXPORT_CTX_LEN
+        vision_batch_size = batch_size if vision_batch_size is None else vision_batch_size
         # img_size is accepted by generic VLM compile APIs, but MiniMax-M3 VLM
         # specialization derives language/vision shapes from patch settings.
         # Drop it to avoid leaking `-img-size=None` into qaic-compile flags.
@@ -3917,7 +3931,7 @@ class QEffMiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForConditionalG
                 "seq_len": seq_len,
                 "ctx_len": ctx_len,
                 "vision_size": vision_size,
-                "vision_batch_size": batch_size,
+                "vision_batch_size": vision_batch_size,
             }
             if use_context_kv:
                 if use_row_folded_main_kv:
@@ -3954,7 +3968,13 @@ class QEffMiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForConditionalG
             specs = [_build_spec(prefill_seq_len), _build_spec(1)]
 
         if kv_offload:
-            vision = [{"batch_size": batch_size, "num_image_patches": num_image_patches, "num_images": num_images}]
+            vision = [
+                {
+                    "batch_size": vision_batch_size,
+                    "num_image_patches": num_image_patches,
+                    "num_images": num_images,
+                }
+            ]
             if comp_ctx_lengths_prefill and comp_ctx_lengths_decode:
                 lang = [_build_lang_spec(prefill_seq_len, c) for c in comp_ctx_lengths_prefill]
                 lang.extend(_build_lang_spec(1, c) for c in comp_ctx_lengths_decode)
@@ -3979,6 +3999,7 @@ class QEffMiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForConditionalG
             "input_ids": {0: "batch_size", 1: "seq_len"},
             "position_ids": {0: "batch_size", 1: "seq_len"},
             "vision_embeds": {0: "vision_batch_size", 1: "vision_size"},
+            "image_idx": {},
         }
 
         lm_config = self.model.language_model.config
@@ -4001,7 +4022,7 @@ class QEffMiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForConditionalG
         past_ctx_axis = "main_kv_ctx_len" if use_context_main_kv else "ctx_len"
         standard_past_batch_axis = "full_batch_size" if continuous_batching else "batch_size"
         indexer_batch_axis = "full_batch_size" if continuous_batching else "batch_size"
-        indexer_ctx_axis = "ctx_len"
+        indexer_ctx_axis = "indexer_kv_ctx_len"
 
         def _set_retained_state_axes(name: str, axes: dict[int, str]) -> None:
             """Keep each retained-state output's split signature identical to its input."""

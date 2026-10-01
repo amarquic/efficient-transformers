@@ -44,6 +44,16 @@ def _normalize_int(value: Optional[torch.Tensor | int]) -> int:
     return int(value) if value is not None else 0
 
 
+def _is_dynamo_compiling() -> bool:
+    dynamo = getattr(torch, "_dynamo", None)
+    if dynamo is None:
+        return False
+    try:
+        return bool(dynamo.is_compiling())
+    except Exception:
+        return False
+
+
 def update_running_softmax(
     current_max: torch.Tensor,
     attn_weights_block: torch.Tensor,
@@ -106,7 +116,7 @@ def update_running_softmax_prefill(
     current_denominator_updated = prev_denominator * torch.exp(delta_max) + curr_exp_sum
     prev_output = output
     output_updated = prev_output * torch.exp(delta_max.unsqueeze(-1)) + torch.matmul(current_exp, v_block)
-    if skip_kv and (torch.onnx.is_in_onnx_export() or torch.jit.is_tracing()):
+    if skip_kv and (torch.onnx.is_in_onnx_export() or torch.jit.is_tracing() or _is_dynamo_compiling()):
         assert skip_future is not None
         current_max = torch.where(skip_future, prev_max, current_max_updated)
         current_denominator = torch.where(skip_future, prev_denominator, current_denominator_updated)
@@ -781,7 +791,7 @@ def blocked_qkv_attention_forward_prefill_online(
     )
 
     q_fold = query.reshape(B, num_cores, n_rep_per_core, QL, D)
-    is_export = torch.onnx.is_in_onnx_export() or torch.jit.is_tracing()
+    is_export = torch.onnx.is_in_onnx_export() or torch.jit.is_tracing() or _is_dynamo_compiling()
     t_chunks = []
     for t_start in range(0, QL, ql_chunk):
         t_end = min(t_start + ql_chunk, QL)
@@ -818,9 +828,10 @@ def blocked_qkv_attention_forward_prefill_online(
 
             skip_future = None
             if skip_kv:
-                skip_future = (torch.tensor(start_index, device=query.device) > current_position).all()
-                if not is_export and skip_future.item():
-                    break
+                skip_future = (start_index > current_position).all()
+                if not torch.onnx.is_in_onnx_export() and not torch.jit.is_tracing() and not torch._dynamo.is_compiling():
+                    if skip_future.item():
+                        break
 
             k_block = past_key_value.read_only_blocked_K(start_index, end_index, layer_idx, cache_kwargs)
             v_block = past_key_value.read_only_blocked_V(start_index, end_index, layer_idx, cache_kwargs)
