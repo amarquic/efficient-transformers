@@ -1572,8 +1572,11 @@ class QEffMiniMaxM3VLIndexer(MiniMaxM3VLIndexer):
             .expand(batch_local, rows, query_len)
         )
         block_id = torch.where(row_live, batch_id, torch.iinfo(torch.int32).max).to(torch.int32)
+        position_remainder = position_ids_dp - torch.div(
+            position_ids_dp, cfg.index_block_size, rounding_mode="trunc"
+        ) * cfg.index_block_size
         addr = (
-            ((logical_index_block // cp) * cfg.index_block_size + position_ids_dp % cfg.index_block_size)
+            (torch.div(logical_index_block, cp, rounding_mode="trunc") * cfg.index_block_size + position_remainder)
             .to(torch.int32)[:, :, None, None, :]
             .expand(batch_local, dp, cp, hkv, query_len)
             .reshape(batch_local, rows, query_len)
@@ -1613,10 +1616,9 @@ class QEffMiniMaxM3VLIndexer(MiniMaxM3VLIndexer):
             if start < end:
                 block_ranges.append((start, end))
 
-        candidate_score_groups: list[torch.Tensor] = []
-        candidate_block_groups: list[torch.Tensor] = []
-        local_batch_size = 1
         is_export = torch.onnx.is_in_onnx_export() or torch.jit.is_tracing() or torch._dynamo.is_compiling()
+        core_topk = min(selected_blocks, num_kv_blocks * blocks_per_core)
+        device_topk = min(selected_blocks, num_cores * core_topk)
 
         def make_block_ids_rows(start: int, local: int) -> torch.Tensor:
             block_start = start * cp // cfg.index_block_size
@@ -1632,18 +1634,23 @@ class QEffMiniMaxM3VLIndexer(MiniMaxM3VLIndexer):
                 .reshape(local, rows, num_cores, blocks_per_core)
             )
 
-        for batch_start in range(0, batch_local, local_batch_size):
-            batch_end = min(batch_start + local_batch_size, batch_local)
-            local = batch_end - batch_start
-            q_local = q_rows[batch_start:batch_end]
-            key_local = index_key_cache[batch_start:batch_end] if not index_cache_is_flat_dp_layout else index_key_cache
-            pos_local = position_ids_dp[batch_start:batch_end]
+        def compute_local_batch(batch_index: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            local = 1
+            q_local = torch.index_select(q_rows, 0, batch_index)
+            if index_cache_is_flat_dp_layout:
+                key_local = torch.index_select(
+                    index_key_cache.reshape(batch_local, rows, cache_slots, dim), 0, batch_index
+                ).reshape(rows, cache_slots, dim)
+            else:
+                key_local = torch.index_select(index_key_cache, 0, batch_index)
+            pos_local = torch.index_select(position_ids_dp, 0, batch_index)
+            q_pos_rows_local = torch.index_select(q_pos_rows_all, 0, batch_index)
             q_5d = q_local.unsqueeze(2).expand(local, rows, num_cores, ql_eff, dim)
             # q_5d: [local, rows, num_cores, ql_eff, dim]
             device_block_score_groups: list[torch.Tensor] = []
             device_block_id_groups: list[torch.Tensor] = []
             q_block_rows = (
-                (position_ids_dp[batch_start:batch_end, :, 0] // cfg.index_block_size)
+                torch.div(pos_local[:, :, 0], cfg.index_block_size, rounding_mode="trunc")
                 .view(local, dp, 1, 1)
                 .expand(local, dp, cp, hkv)
                 .reshape(local, rows)
@@ -1652,9 +1659,7 @@ class QEffMiniMaxM3VLIndexer(MiniMaxM3VLIndexer):
             def read_key_block(start: int, end: int) -> torch.Tensor:
                 return (
                     self._read_blocked_k_flat_dp(
-                        key_local.reshape(batch_local, rows, cache_slots, dim)[batch_start:batch_end].reshape(
-                            local * rows, cache_slots, dim
-                        ),
+                        key_local,
                         pos_local,
                         start,
                         end,
@@ -1685,8 +1690,8 @@ class QEffMiniMaxM3VLIndexer(MiniMaxM3VLIndexer):
                 start, _ = block_ranges[block_idx]
                 block_ids_rows = make_block_ids_rows(start, local)
                 block_skip_future = (
-                    torch.tensor(start * cp, device=hidden_states.device, dtype=q_pos_rows_all.dtype)
-                    > q_pos_rows_all[batch_start:batch_end]
+                    _scalar_like(q_pos_rows_all, start * cp)
+                    > q_pos_rows_local
                 )
                 if skip_kv and not is_export and bool(block_skip_future.all().item()):
                     masked_block = torch.full(
@@ -1719,8 +1724,8 @@ class QEffMiniMaxM3VLIndexer(MiniMaxM3VLIndexer):
                 epilogue_start, _ = block_ranges[epilogue_idx]
                 epilogue_block_ids = make_block_ids_rows(epilogue_start, local)
                 epilogue_skip_future = (
-                    torch.tensor(epilogue_start * cp, device=hidden_states.device, dtype=q_pos_rows_all.dtype)
-                    > q_pos_rows_all[batch_start:batch_end]
+                    _scalar_like(q_pos_rows_all, epilogue_start * cp)
+                    > q_pos_rows_local
                 )
                 epilogue_scores = compute_block_scores(key_5d)
                 if skip_kv:
@@ -1761,17 +1766,57 @@ class QEffMiniMaxM3VLIndexer(MiniMaxM3VLIndexer):
             device_topk = min(selected_blocks, core_candidate_scores.shape[-1])
             device_topk_scores, device_topk_indices = torch.topk(core_candidate_scores, k=device_topk, dim=-1)
             device_topk_block_ids = torch.gather(core_candidate_block_ids, -1, device_topk_indices)
-            candidate_score_groups.append(device_topk_scores)
-            candidate_block_groups.append(device_topk_block_ids)
+            return device_topk_scores, device_topk_block_ids
+
+        if torch._dynamo.is_compiling():
+            candidate_scores_flat = torch.zeros(
+                (batch_local, rows, ql_eff, device_topk),
+                dtype=torch.float32,
+                device=hidden_states.device,
+            )
+            candidate_block_indices_flat = torch.zeros(
+                (batch_local, rows, ql_eff, device_topk),
+                dtype=torch.int64,
+                device=hidden_states.device,
+            )
+
+            def loop_cond(loop_index, scores_output, block_indices_output):
+                return loop_index < batch_local
+
+            def loop_body(loop_index, scores_output, block_indices_output):
+                batch_index = loop_index.reshape(1)
+                local_scores, local_block_indices = compute_local_batch(batch_index)
+                return (
+                    loop_index + 1,
+                    torch.index_copy(scores_output, 0, batch_index, local_scores),
+                    torch.index_copy(block_indices_output, 0, batch_index, local_block_indices),
+                )
+
+            loop_index = torch.zeros((), dtype=torch.int64, device=hidden_states.device)
+            _, candidate_scores_flat, candidate_block_indices_flat = torch.while_loop(
+                loop_cond,
+                loop_body,
+                (loop_index, candidate_scores_flat, candidate_block_indices_flat),
+            )
+        else:
+            candidate_score_groups: list[torch.Tensor] = []
+            candidate_block_groups: list[torch.Tensor] = []
+            for batch_start in range(batch_local):
+                batch_index = torch.tensor([batch_start], dtype=torch.int64, device=hidden_states.device)
+                local_scores, local_block_indices = compute_local_batch(batch_index)
+                candidate_score_groups.append(local_scores)
+                candidate_block_groups.append(local_block_indices)
+            candidate_scores_flat = torch.cat(candidate_score_groups, dim=0)
+            candidate_block_indices_flat = torch.cat(candidate_block_groups, dim=0)
 
         candidate_scores = (
-            torch.cat(candidate_score_groups, dim=0)
+            candidate_scores_flat
             .view(batch_local, dp, cp, hkv, q_heads_per_kv, query_len, device_topk)
             .permute(0, 1, 3, 4, 5, 2, 6)
             .reshape(batch_local, dp, hkv, q_heads_per_kv, query_len, cp * device_topk)
         )
         candidate_block_indices = (
-            torch.cat(candidate_block_groups, dim=0)
+            candidate_block_indices_flat
             .view(batch_local, dp, cp, hkv, q_heads_per_kv, query_len, device_topk)
             .permute(0, 1, 3, 4, 5, 2, 6)
             .reshape(batch_local, dp, hkv, q_heads_per_kv, query_len, cp * device_topk)
