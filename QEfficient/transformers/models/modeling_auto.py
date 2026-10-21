@@ -1812,9 +1812,10 @@ class _QEffAutoModelForImageTextToTextDualQPC:
                 self.__update_prefill_transform(enable=True, enable_chunking=enable_chunking)
             else:
                 self.__update_prefill_transform(False, retain_full_kv=kwargs.get("retain_full_kv", False))
+        retain_full_prefill_cache = prefill_only and enable_chunking
         onnx_kwargs = {
             "prefill_seq_len": seq_len,
-            "past_seq_len": ctx_len if seq_len == 1 else seq_len,
+            "past_seq_len": ctx_len if seq_len == 1 or retain_full_prefill_cache else seq_len,
             "batch_size": bs,
         }
         dynamic_axes_kwargs = {

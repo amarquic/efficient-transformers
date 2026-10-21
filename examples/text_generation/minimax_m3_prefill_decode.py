@@ -30,12 +30,14 @@ def _expand_batch(inputs, batch_size: int):
     return expanded
 
 
-def _execution_batch_size(batch_size: int, msa_indexer_dp: int, msa_attn_dp: int) -> int:
-    return batch_size * math.lcm(msa_indexer_dp, msa_attn_dp)
+def _execution_batch_size(batch_size: int, *dp_factors: int) -> int:
+    return batch_size * math.lcm(*dp_factors)
 
 
 def _build_qaic_config(
     *,
+    attn_dp: int,
+    attn_cp: int,
     msa_indexer_dp: int,
     msa_indexer_cp: int,
     msa_attn_dp: int,
@@ -44,6 +46,9 @@ def _build_qaic_config(
     indexer_prefill_parallel: bool,
     indexer_q_chunk: int | None,
     indexer_q_size: int | None,
+    indexer_num_blocks: int | None,
+    msa_num_kv_blocks: int | None,
+    num_kv_blocks: int,
     num_cores: int,
     msa_q_chunk: int,
     expert_parallel_chunk_size: int,
@@ -53,7 +58,9 @@ def _build_qaic_config(
     """Build the MiniMax blocking config for one phase (prefill or decode)."""
     qaic_config = {
         "blocking_mode": "kv_headpar",
-        "num_kv_blocks": 2,
+        "num_kv_blocks": num_kv_blocks,
+        "attn_dp": attn_dp,
+        "attn_cp": attn_cp,
         "msa_indexer_dp": msa_indexer_dp,
         "msa_indexer_cp": msa_indexer_cp,
         "msa_attn_dp": msa_attn_dp,
@@ -73,6 +80,10 @@ def _build_qaic_config(
         qaic_config["indexer_q_chunk"] = indexer_q_chunk
     if indexer_q_size is not None:
         qaic_config["indexer_q_size"] = indexer_q_size
+    if indexer_num_blocks is not None:
+        qaic_config["indexer_num_blocks"] = indexer_num_blocks
+    if msa_num_kv_blocks is not None:
+        qaic_config["msa_num_kv_blocks"] = msa_num_kv_blocks
     return qaic_config
 
 
@@ -114,7 +125,7 @@ def main():
         default=None,
         help="Number of devices used by the decode QPC; defaults to --num-devices.",
     )
-    parser.add_argument("--num-cores", type=int, default=16)
+    parser.add_argument("--num-cores", type=int, default=4)
     parser.add_argument(
         "--mdp-num-partitions",
         "--prefill-mdp-num-partitions",
@@ -159,10 +170,32 @@ def main():
         default=True,
         help="Disable tree-reduce for MoE expert-parallel dispatch.",
     )
+    parser.add_argument(
+        "--prefill-attn-dp", type=int, default=1, help="Prefill dense GQA attention DP factor."
+    )
+    parser.add_argument(
+        "--prefill-attn-cp", type=int, default=1, help="Prefill dense GQA attention CP factor."
+    )
     parser.add_argument("--prefill-msa-indexer-dp", type=int, default=1, help="Prefill MSA indexer DP factor.")
     parser.add_argument("--prefill-msa-indexer-cp", type=int, default=1, help="Prefill MSA indexer CP factor.")
     parser.add_argument("--prefill-msa-attn-dp", type=int, default=1, help="Prefill MSA attention DP factor.")
     parser.add_argument("--prefill-msa-attn-cp", type=int, default=1, help="Prefill MSA attention CP factor.")
+    parser.add_argument(
+        "--attn-dp",
+        "--decode-attn-dp",
+        dest="decode_attn_dp",
+        type=int,
+        default=1,
+        help="Decode dense GQA attention DP factor (legacy --attn-dp alias).",
+    )
+    parser.add_argument(
+        "--attn-cp",
+        "--decode-attn-cp",
+        dest="decode_attn_cp",
+        type=int,
+        default=1,
+        help="Decode dense GQA attention CP factor (legacy --attn-cp alias).",
+    )
     parser.add_argument(
         "--msa-indexer-dp",
         "--decode-msa-indexer-dp",
@@ -228,9 +261,45 @@ def main():
     )
     parser.add_argument(
         "--num-kv-blocks",
+        "--prefill-num-kv-blocks",
+        dest="prefill_num_kv_blocks",
         type=int,
         default=16,
-        help="Number of prefill KV blocks.",
+        help="Number of prefill dense-GQA KV blocks (legacy --num-kv-blocks alias).",
+    )
+    parser.add_argument(
+        "--indexer-num-blocks",
+        "--prefill-indexer-num-blocks",
+        dest="prefill_indexer_num_blocks",
+        type=int,
+        default=None,
+        help="Prefill MSA indexer KV blocks; defaults to --prefill-num-kv-blocks.",
+    )
+    parser.add_argument(
+        "--msa-num-kv-blocks",
+        "--prefill-msa-num-kv-blocks",
+        dest="prefill_msa_num_kv_blocks",
+        type=int,
+        default=None,
+        help="Prefill sparse-MSA attention KV blocks; defaults to --prefill-num-kv-blocks.",
+    )
+    parser.add_argument(
+        "--decode-num-kv-blocks",
+        type=int,
+        default=2,
+        help="Number of decode dense-GQA KV blocks.",
+    )
+    parser.add_argument(
+        "--decode-indexer-num-blocks",
+        type=int,
+        default=None,
+        help="Decode MSA indexer KV blocks; defaults to --decode-num-kv-blocks.",
+    )
+    parser.add_argument(
+        "--decode-msa-num-kv-blocks",
+        type=int,
+        default=None,
+        help="Decode sparse-MSA attention KV blocks; defaults to --decode-num-kv-blocks.",
     )
     parser.add_argument(
         "--q-block-size",
@@ -251,8 +320,19 @@ def main():
         parser.error("--decode-num-devices must be positive")
     if args.prefill_seq_len <= 1:
         parser.error("--prefill-seq-len must be greater than 1")
-    if args.num_kv_blocks < 1:
-        parser.error("--num-kv-blocks must be positive")
+    if args.prefill_num_kv_blocks < 1:
+        parser.error("--prefill-num-kv-blocks must be positive")
+    if args.decode_num_kv_blocks < 1:
+        parser.error("--decode-num-kv-blocks must be positive")
+    for name in (
+        "prefill_indexer_num_blocks",
+        "prefill_msa_num_kv_blocks",
+        "decode_indexer_num_blocks",
+        "decode_msa_num_kv_blocks",
+    ):
+        value = getattr(args, name)
+        if value is not None and value < 1:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.q_block_size < 1:
         parser.error("--q-block-size must be positive")
     if args.q_block_chunk < 1:
@@ -276,17 +356,23 @@ def main():
     ):
         parser.error("--indexer-q-chunk must be at least and divisible by --indexer-q-size")
     phase_values = (
+        args.prefill_attn_dp,
+        args.prefill_attn_cp,
         args.prefill_msa_indexer_dp,
         args.prefill_msa_indexer_cp,
         args.prefill_msa_attn_dp,
         args.prefill_msa_attn_cp,
+        args.decode_attn_dp,
+        args.decode_attn_cp,
         args.decode_msa_indexer_dp,
         args.decode_msa_indexer_cp,
         args.decode_msa_attn_dp,
         args.decode_msa_attn_cp,
     )
     if any(value < 1 for value in phase_values):
-        parser.error("All MSA DP/CP factors must be positive")
+        parser.error("All attention DP/CP factors must be positive")
+    if args.prefill_attn_dp != 1 or args.prefill_attn_cp != 1:
+        parser.error("MiniMax dense-GQA prefill currently requires prefill attention DP=1 and CP=1")
     if args.prefill_msa_indexer_dp != 1 or args.prefill_msa_indexer_cp != 1:
         parser.error("MiniMax MSA prefill currently requires prefill indexer DP=1 and CP=1")
     if args.prefill_msa_attn_dp != 1:
@@ -295,9 +381,12 @@ def main():
         parser.error("MiniMax MSA prefill currently requires prefill attention CP=1")
 
     # Both QPCs must use the same physical execution batch for the explicit KV handoff.
-    execution_batch_size = args.batch_size * math.lcm(
+    execution_batch_size = _execution_batch_size(
+        args.batch_size,
+        args.prefill_attn_dp,
         args.prefill_msa_indexer_dp,
         args.prefill_msa_attn_dp,
+        args.decode_attn_dp,
         args.decode_msa_indexer_dp,
         args.decode_msa_attn_dp,
     )
@@ -312,7 +401,8 @@ def main():
     factory_kwargs["config"] = config
 
     t0 = time.perf_counter()
-    qeff_model = QEFFAutoModelForImageTextToText.from_pretrained(args.model_id, **factory_kwargs)
+    qeff_model = QEFFAutoModelForImageTextToText.from_pretrained(args.model_id, weight_free=True, **factory_kwargs)
+    qeff_model.model.eval()
     print(f"[timing] model load:          {time.perf_counter() - t0:.2f}s")
 
     common_compile_kwargs = dict(
@@ -331,6 +421,8 @@ def main():
     )
 
     prefill_qaic_config = _build_qaic_config(
+        attn_dp=args.prefill_attn_dp,
+        attn_cp=args.prefill_attn_cp,
         msa_indexer_dp=args.prefill_msa_indexer_dp,
         msa_indexer_cp=args.prefill_msa_indexer_cp,
         msa_attn_dp=args.prefill_msa_attn_dp,
@@ -339,6 +431,9 @@ def main():
         indexer_prefill_parallel=args.indexer_prefill_parallel,
         indexer_q_chunk=args.indexer_q_chunk,
         indexer_q_size=args.indexer_q_size,
+        indexer_num_blocks=args.prefill_indexer_num_blocks,
+        msa_num_kv_blocks=args.prefill_msa_num_kv_blocks,
+        num_kv_blocks=args.prefill_num_kv_blocks,
         num_cores=args.num_cores,
         msa_q_chunk=args.msa_q_chunk,
         expert_parallel_chunk_size=args.expert_parallel_chunk_size,
@@ -347,7 +442,6 @@ def main():
     )
     prefill_qaic_config.update(
         blocking_mode="prefill_online",
-        num_kv_blocks=args.num_kv_blocks,
         num_q_blocks=num_q_blocks,
         n_rep_chunk=n_rep_chunk,
         ctx_len=args.ctx_len,
@@ -357,24 +451,33 @@ def main():
         num_devices=args.num_devices,
         qaic_config=prefill_qaic_config,
     )
+    decode_qaic_config = _build_qaic_config(
+        attn_dp=args.decode_attn_dp,
+        attn_cp=args.decode_attn_cp,
+        msa_indexer_dp=args.decode_msa_indexer_dp,
+        msa_indexer_cp=args.decode_msa_indexer_cp,
+        msa_attn_dp=args.decode_msa_attn_dp,
+        msa_attn_cp=args.decode_msa_attn_cp,
+        indexer_n_head=args.indexer_n_head,
+        indexer_prefill_parallel=False,
+        indexer_q_chunk=None,
+        indexer_q_size=None,
+        indexer_num_blocks=args.decode_indexer_num_blocks,
+        msa_num_kv_blocks=args.decode_msa_num_kv_blocks,
+        num_kv_blocks=args.decode_num_kv_blocks,
+        num_cores=args.num_cores,
+        msa_q_chunk=args.msa_q_chunk,
+        expert_parallel_chunk_size=args.expert_parallel_chunk_size,
+        cores_per_expert=args.cores_per_expert,
+        tree_reduce=args.tree_reduce,
+    )
+    print(f"[config] prefill qaic_config: {prefill_qaic_config}")
+    print(f"[config] decode qaic_config:  {decode_qaic_config}")
+
     decode_compile_kwargs = dict(
         **common_compile_kwargs,
         num_devices=decode_num_devices,
-        qaic_config=_build_qaic_config(
-            msa_indexer_dp=args.decode_msa_indexer_dp,
-            msa_indexer_cp=args.decode_msa_indexer_cp,
-            msa_attn_dp=args.decode_msa_attn_dp,
-            msa_attn_cp=args.decode_msa_attn_cp,
-            indexer_n_head=args.indexer_n_head,
-            indexer_prefill_parallel=False,
-            indexer_q_chunk=None,
-            indexer_q_size=None,
-            num_cores=args.num_cores,
-            msa_q_chunk=args.msa_q_chunk,
-            expert_parallel_chunk_size=args.expert_parallel_chunk_size,
-            cores_per_expert=args.cores_per_expert,
-            tree_reduce=args.tree_reduce,
-        ),
+        qaic_config=decode_qaic_config,
     )
 
     t0 = time.perf_counter()

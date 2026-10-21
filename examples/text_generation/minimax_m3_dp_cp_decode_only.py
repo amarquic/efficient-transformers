@@ -56,6 +56,15 @@ def main():
     parser.add_argument("--num-cores", type=int, default=16)
     parser.add_argument("--generation-len", type=int, default=32)
     parser.add_argument(
+        "--decode-end-position",
+        type=int,
+        default=None,
+        help=(
+            "Set the final timed decode position ID. The prompt is reduced to one token and placed so that "
+            "generation ends at this position. Use ctx_len - 1 to benchmark the end of the context."
+        ),
+    )
+    parser.add_argument(
         "--batch-size",
         type=int,
         default=1,
@@ -186,6 +195,14 @@ def main():
     args = parser.parse_args()
     if args.batch_size < 1:
         parser.error("--batch-size must be positive")
+    if args.generation_len < 2 and args.decode_end_position is not None:
+        parser.error("--generation-len must be at least 2 when --decode-end-position is used")
+    if args.decode_end_position is not None:
+        if args.decode_end_position < 0 or args.decode_end_position >= args.ctx_len:
+            parser.error("--decode-end-position must be in [0, ctx_len - 1]")
+        prefill_position = args.decode_end_position - (args.generation_len - 1)
+        if prefill_position < 0:
+            parser.error("--generation-len is too large for the requested --decode-end-position")
     if args.num_kv_blocks < 1:
         parser.error("--num-kv-blocks must be positive")
     for name in ("indexer_num_blocks", "msa_num_kv_blocks"):
@@ -279,17 +296,40 @@ def main():
         return_dict=True,
         return_tensors="pt",
     )
+    if args.decode_end_position is not None:
+        prompt_tokens = inputs["input_ids"].shape[-1]
+        for name, value in inputs.items():
+            if torch.is_tensor(value) and value.ndim >= 2 and value.shape[-1] == prompt_tokens:
+                inputs[name] = value[..., -1:]
+        inputs["position_ids"] = torch.full_like(inputs["input_ids"], prefill_position)
+        first_decode_position = prefill_position + 1
+        print(
+            f"[decode] timed position IDs: {first_decode_position}..{args.decode_end_position} "
+            f"({args.generation_len - 1} decode steps)"
+        )
     inputs = _expand_batch(inputs, execution_batch_size)
     t0 = time.perf_counter()
     output = qeff_model.generate(inputs=inputs, generation_len=args.generation_len, device_ids=device_ids)
     generate_time = time.perf_counter() - t0
 
-    num_generated = output.generated_ids.shape[-1]
-    toks_per_sec = num_generated / float(generate_time)
-    print(f"[timing] generation:          {generate_time:.2f}s  ({num_generated} tokens, {toks_per_sec:.02f} tok/s)")
+    num_generated = args.generation_len
+    full_call_toks_per_sec = num_generated / float(generate_time)
+    print(
+        f"[timing] generation call:     {generate_time:.2f}s  "
+        f"({num_generated} tokens, {full_call_toks_per_sec:.02f} tok/s including setup/prefill)"
+    )
+    decode_steps = num_generated - 1
+    decode_time = output.perf_metrics.total_time - output.perf_metrics.prefill_time
+    if decode_steps > 0 and decode_time > 0:
+        decode_toks_per_sec = decode_steps / float(decode_time)
+        print(
+            f"[performance] decode:         {decode_time:.6f}s  "
+            f"({decode_steps} steps, {decode_toks_per_sec:.02f} tok/s)"
+        )
 
-    print(output.generated_ids)
-    print(tokenizer.batch_decode(output.generated_ids))
+    generated_ids = output.generated_ids[:, :num_generated]
+    print(generated_ids)
+    print(tokenizer.batch_decode(generated_ids))
 
 
 if __name__ == "__main__":
