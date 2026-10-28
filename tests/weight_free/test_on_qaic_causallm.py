@@ -18,6 +18,8 @@ Covers causal-LM generation, HF/QAIC parity, and embedding parity.
 from __future__ import annotations
 
 import os
+import time
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -31,6 +33,7 @@ from transformers import (
 from QEfficient.blocking.attention_blocking import BlockingMode
 from QEfficient.transformers.embeddings.embedding_utils import POOLING_MAP
 from QEfficient.transformers.models.modeling_auto import QEFFAutoModel, QEFFAutoModelForCausalLM
+from QEfficient.utils.constants import DEFAULT_AIC_NUM_CORES
 from QEfficient.utils import get_num_layers_from_config
 from QEfficient.utils.device_utils import get_available_device_id, get_qaic_mdp_device_groups
 
@@ -53,6 +56,10 @@ from ._helpers import (
 
 BLOCKING_PARITY_PROMPT = "Hello world"
 HEAD_BLOCKING_NUM_DEVICES = 4
+
+
+def _directory_size_bytes(path: Path) -> int:
+    return sum(file.stat().st_size for file in path.rglob("*") if file.is_file())
 
 
 def _blocking_runtime_options(blocking_key: str) -> tuple[dict, list[int] | None]:
@@ -136,7 +143,7 @@ def test_weight_free_embedding_hw_hf_parity(model_type, model_id, pooling, tmp_e
         compile_dir=str(tmp_export_dir / f"{model_type}_compile"),
         seq_len=32,
         batch_size=1,
-        num_cores=16,
+        num_cores=DEFAULT_AIC_NUM_CORES,
     )
     qaic_output = qeff_model.generate(inputs=inputs)
 
@@ -173,7 +180,7 @@ def test_weight_free_generate_fp16(model_type, model_id, tmp_export_dir):
         compile_dir=str(tmp_export_dir / "wf_gen_compile"),
         prefill_seq_len=PROMPT_LEN,
         ctx_len=CTX_LEN,
-        num_cores=16,
+        num_cores=DEFAULT_AIC_NUM_CORES,
         batch_size=BATCH_SIZE,
         use_onnx_subfunctions=True,
     )
@@ -231,7 +238,7 @@ def test_weight_free_hw_hf_parity(model_type, model_id, tmp_export_dir):
         compile_dir=str(tmp_export_dir / "wf_hw_parity_compile"),
         prefill_seq_len=PROMPT_LEN,
         ctx_len=CTX_LEN,
-        num_cores=16,
+        num_cores=DEFAULT_AIC_NUM_CORES,
         batch_size=BATCH_SIZE,
         use_onnx_subfunctions=True,
     )
@@ -281,7 +288,7 @@ def test_weight_free_vs_legacy_qaic_parity(model_type, model_id, tmp_export_dir)
         compile_dir=str(tmp_export_dir / "legacy_compile"),
         prefill_seq_len=PROMPT_LEN,
         ctx_len=CTX_LEN,
-        num_cores=16,
+        num_cores=DEFAULT_AIC_NUM_CORES,
         batch_size=BATCH_SIZE,
         use_onnx_subfunctions=True,
     )
@@ -311,7 +318,7 @@ def test_weight_free_vs_legacy_qaic_parity(model_type, model_id, tmp_export_dir)
         compile_dir=str(tmp_export_dir / "wf_vs_legacy_compile"),
         prefill_seq_len=PROMPT_LEN,
         ctx_len=CTX_LEN,
-        num_cores=16,
+        num_cores=DEFAULT_AIC_NUM_CORES,
         batch_size=BATCH_SIZE,
         use_onnx_subfunctions=True,
     )
@@ -345,8 +352,9 @@ def test_weight_free_blocked_hw_hf_parity_and_artifact_metrics(
     model_id,
     blocking_key,
     tmp_export_dir,
+    record_property,
 ):
-    """HF PT tokens match blocked weight-free QAIC tokens."""
+    """HF PT tokens == blocked weight-free QAIC tokens, with export/compile artifact metrics."""
     from QEfficient.utils.run_utils import ApiRunner
 
     use_onnx_subfunctions = True
@@ -380,6 +388,7 @@ def test_weight_free_blocked_hw_hf_parity_and_artifact_metrics(
         qaic_config=qaic_config,
     )
 
+    export_start = time.perf_counter()
     onnx_path = exported_onnx_path(
         qeff_model.export(
             tmp_export_dir / f"wf_blocking_{model_type}_{blocking_key}_{use_onnx_subfunctions}_export",
@@ -388,6 +397,8 @@ def test_weight_free_blocked_hw_hf_parity_and_artifact_metrics(
             offload_pt_weights=False,
         )
     )
+    export_seconds = time.perf_counter() - export_start
+    onnx_size_bytes = onnx_path.stat().st_size
 
     blocking_config = qeff_model.hash_params.get("blocking_kwargs")
     assert blocking_config is not None
@@ -396,17 +407,38 @@ def test_weight_free_blocked_hw_hf_parity_and_artifact_metrics(
         assert_has_subfunctions(onnx_path, qeff_model)
     assert_blocked_kv_ops_for_mode(onnx_path, qeff_model, blocking_key)
 
+    compile_start = time.perf_counter()
     compile_options, device_ids = _blocking_runtime_options(blocking_key)
-    qeff_model.compile(
-        onnx_path=str(onnx_path),
-        compile_dir=str(tmp_export_dir / f"wf_blocking_{model_type}_{blocking_key}_{use_onnx_subfunctions}_compile"),
-        prefill_seq_len=PROMPT_LEN,
-        ctx_len=CTX_LEN,
-        num_cores=16,
-        batch_size=BATCH_SIZE,
-        qaic_config=qaic_config,
-        use_onnx_subfunctions=use_onnx_subfunctions,
-        **compile_options,
+    qpc_path = Path(
+        qeff_model.compile(
+            onnx_path=str(onnx_path),
+            compile_dir=str(
+                tmp_export_dir / f"wf_blocking_{model_type}_{blocking_key}_{use_onnx_subfunctions}_compile"
+            ),
+            prefill_seq_len=PROMPT_LEN,
+            ctx_len=CTX_LEN,
+            num_cores=DEFAULT_AIC_NUM_CORES,
+            batch_size=BATCH_SIZE,
+            qaic_config=qaic_config,
+            use_onnx_subfunctions=use_onnx_subfunctions,
+            **compile_options,
+        )
+    )
+    compile_seconds = time.perf_counter() - compile_start
+    qpc_size_bytes = _directory_size_bytes(qpc_path)
+
+    for name, value in {
+        "onnx_export_seconds": export_seconds,
+        "onnx_size_bytes": onnx_size_bytes,
+        "qpc_compile_seconds": compile_seconds,
+        "qpc_size_bytes": qpc_size_bytes,
+    }.items():
+        record_property(name, value)
+    print(
+        f"weight_free_blocking_metrics model={model_type} mode={blocking_key} "
+        f"use_onnx_subfunctions={use_onnx_subfunctions} "
+        f"onnx_export_seconds={export_seconds:.3f} onnx_size_bytes={onnx_size_bytes} "
+        f"qpc_compile_seconds={compile_seconds:.3f} qpc_size_bytes={qpc_size_bytes}"
     )
 
     qaic_output = qeff_model.generate(
