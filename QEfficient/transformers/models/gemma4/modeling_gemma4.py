@@ -1361,10 +1361,7 @@ class QEffGemma4EncoderWrapper(nn.Module):
             std_scale = vision_tower.std_scale.to(hidden_states.device)
             # Fold the scale before applying the root hidden-size factor to avoid
             # the fp16 overflow in the intermediate pooled activation.
-            hidden_states = (
-                hidden_states * (pooler.root_hidden_size * std_scale)
-                - std_bias * std_scale
-            )
+            hidden_states = hidden_states * (pooler.root_hidden_size * std_scale) - std_bias * std_scale
         else:
             hidden_states = hidden_states * pooler.root_hidden_size
 
