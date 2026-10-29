@@ -904,6 +904,11 @@ class QEFFBaseModel(ABC):
             bs = require_value(get_attr_or_key(specializations[0], ("batch_size", "batch")), "batch size")
             seq_len = get_attr_or_key(specializations[0], ("cl", "seq_len", "sequence_length"))
             ctx_len = get_attr_or_key(specializations[0], ("ctx_len", "context_length"))
+            # Paged GQA's decode implementation has a batch-local Python loop.
+            # Match the export example to the fixed batch specialization so
+            # legacy ONNX tracing materializes every requested batch row.
+            if qaic_config is not None and "kv_headpar_paged" in str(qaic_config.get("blocking_mode", "")):
+                kwargs["batch_size"] = bs
         else:
             bs = None
             seq_len = None

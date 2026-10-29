@@ -310,6 +310,31 @@ class TestPreserveNestedCacheRetainedStateTransform:
         assert len(fn.output) == 1, f"Function with 1 scatter should not have outputs added, got {list(fn.output)}"
         assert not model.graph.node[0].output, "Function call must not be partially rewired"
 
+    def test_uses_final_output_of_paged_scatter_chain(self):
+        model = _make_minimal_onnx_with_repeated_subgraphs(num_layers=1, scatter_count_per_fn=2)
+        fn = model.functions[0]
+        fn.node.extend(
+            [
+                helper.make_node(
+                    "CtxPagedScatterPage",
+                    inputs=["scatter_key_0", "next_key_pages", "next_key_updates"],
+                    outputs=["final_key_cache"],
+                    domain="com.qti.aisw.onnx",
+                ),
+                helper.make_node(
+                    "CtxPagedScatterPage",
+                    inputs=["scatter_value_0", "next_value_pages", "next_value_updates"],
+                    outputs=["final_value_cache"],
+                    domain="com.qti.aisw.onnx",
+                ),
+            ]
+        )
+
+        changed = PreserveNestedCacheRetainedStateTransform.apply(model)
+
+        assert changed
+        assert fn.output[-2:] == ["final_key_cache", "final_value_cache"]
+
 
 class TestRenameRepeatedSubgraphTransform:
     def test_renames_repeated_subgraph_functions(self):

@@ -271,7 +271,11 @@ def _paged_gqa_prefill_attention(
         (start, min(start + head_block_size, heads_per_core)) for start in range(0, heads_per_core, head_block_size)
     ]
     output_chunks: list[torch.Tensor] = []
-    is_export = torch.onnx.is_in_onnx_export() or torch.jit.is_tracing()
+    is_export = (
+        torch.onnx.is_in_onnx_export()
+        or torch.jit.is_tracing()
+        or torch._dynamo.is_compiling()
+    )
 
     for query_chunk_start in range(0, query_len, query_chunk_size):
         query_chunk_end = min(query_chunk_start + query_chunk_size, query_len)
@@ -319,12 +323,9 @@ def _paged_gqa_prefill_attention(
         for kv_block_idx in range(num_kv_blocks):
             start_index = kv_block_idx * kv_block_size
             end_index = start_index + kv_block_size
-            if (
-                skip_kv
-                and not is_export
-                and bool((torch.tensor(start_index, device=query.device) > query_chunk_position).all().item())
-            ):
-                break
+            if skip_kv and not is_export:
+                if bool((torch.tensor(start_index, device=query.device) > query_chunk_position).all().item()):
+                    break
             page_start = start_index // page_block_size
             page_end = end_index // page_block_size
             key_batches = []
@@ -342,9 +343,12 @@ def _paged_gqa_prefill_attention(
 
             for query_start in range(query_chunk_start, query_chunk_end, query_block_size):
                 state = query_states[query_start]
-                skip_future = (torch.tensor(start_index, device=query.device) > state["current_position"]).all()
-                if skip_kv and not is_export and bool(skip_future.item()):
-                    continue
+                if skip_kv and not is_export:
+                    skip_future = (torch.tensor(start_index, device=query.device) > state["current_position"]).all()
+                    if bool(skip_future.item()):
+                        continue
+                else:
+                    skip_future = torch.zeros((), dtype=torch.bool, device=query.device)
                 causal = key_positions[None, None, None, :] > state["positions"][:, None, :, None]
                 for accumulator in state["accumulators"]:
                     head_count = accumulator["head_count"]
@@ -352,7 +356,7 @@ def _paged_gqa_prefill_attention(
                     scores = scores.view(batch, num_cores, head_count, state["block_len"], -1)
                     scores = torch.where(
                         causal.unsqueeze(2),
-                        torch.tensor(MIN_MASKED_ATTENTION_VALUE, dtype=scores.dtype, device=scores.device),
+                        torch.full_like(scores, MIN_MASKED_ATTENTION_VALUE),
                         scores,
                     ).reshape(batch, num_cores, head_count * state["block_len"], -1)
                     accumulator["maximum"], accumulator["denominator"], accumulator["output"] = (
@@ -508,19 +512,23 @@ def paged_gqa_attention_forward(
         .expand(batch_local, dp, cp, num_kv_heads, query_len)
         .reshape(batch_local, rows, 1, query_len)
     )
-    query_block = position_rows // logical_block_size
+    query_block = torch.div(position_rows, logical_block_size, rounding_mode="trunc")
     query_block_offset = position_rows - query_block * logical_block_size
-    query_page = query_block_offset // page_block_size
+    query_page = torch.div(query_block_offset, page_block_size, rounding_mode="trunc")
     query_remainder = query_block_offset - query_page * page_block_size
     core_index = torch.arange(num_cores, dtype=position_rows.dtype, device=query.device).view(1, 1, num_cores, 1)
-    row_group = (torch.arange(rows, dtype=position_rows.dtype, device=query.device) // num_kv_heads).view(1, rows, 1, 1)
-    row_way = row_group - (row_group // cp) * cp
+    row_group = torch.div(
+        torch.arange(rows, dtype=position_rows.dtype, device=query.device),
+        num_kv_heads,
+        rounding_mode="trunc",
+    ).view(1, rows, 1, 1)
+    row_way = row_group - torch.div(row_group, cp, rounding_mode="trunc") * cp
     block_indices = torch.arange(num_kv_blocks, dtype=position_rows.dtype, device=query.device).view(
         1, 1, 1, num_kv_blocks
     )
     query_after = (query_block > block_indices).squeeze(2)
     query_in = (query_block == block_indices).squeeze(2)
-    query_page_local = query_page // cp
+    query_page_local = torch.div(query_page, cp, rounding_mode="trunc")
     query_page_way = query_page - query_page_local * cp
     last_page = torch.where(
         row_way < query_page_way,
@@ -529,7 +537,7 @@ def paged_gqa_attention_forward(
     )
     valid_page = last_page >= 0
     safe_page = torch.where(valid_page, last_page, torch.zeros_like(last_page))
-    page_group = safe_page // num_cores
+    page_group = torch.div(safe_page, num_cores, rounding_mode="trunc")
     page_core = safe_page - page_group * num_cores
     group_start = page_group * page_block_size
     threshold_before = group_start + page_block_size - 1

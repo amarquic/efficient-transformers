@@ -4154,6 +4154,7 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         export_dir: str | None = None,
         prefill_only: bool | None = False,
         prefill_seq_len: int | None = None,
+        batch_size: int | None = None,
         num_cores: int = constants.DEFAULT_AIC_NUM_CORES,
         layerwise: bool = False,
         layerwise_window_size: int = 1,
@@ -4247,7 +4248,9 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
                     self.hash_params["retain_full_kv"] = True
         #######################################################################
 
-        bs: int = constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE
+        bs: int = constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE if batch_size is None else int(batch_size)
+        if bs < 1:
+            raise ValueError(f"batch_size must be positive, got {bs}")
         seq_len: int = constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN
         decode_only_export = prefill_only is False and prefill_seq_len == 1
         fbs: int = constants.ONNX_EXPORT_EXAMPLE_FBS
@@ -4484,11 +4487,17 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
                 example_inputs["block_table"] = torch.arange(required_physical_pages, dtype=torch.int64).view(
                     attn_dp, batch_local, num_page_groups
                 )
-                dynamic_axes["block_table"] = {1: "gqa_batch_local", 2: "gqa_page_groups"}
-                pkv_dynamic_axes = {
-                    0: "gqa_physical_pages",
-                    2: "gqa_page_size",
-                }
+                if decode_only_export:
+                    dynamic_axes["input_ids"] = {}
+                    dynamic_axes["position_ids"] = {}
+                    dynamic_axes["block_table"] = {}
+                    pkv_dynamic_axes = {0: "gqa_physical_pages"}
+                else:
+                    dynamic_axes["block_table"] = {1: "gqa_batch_local", 2: "gqa_page_groups"}
+                    pkv_dynamic_axes = {
+                        0: "gqa_physical_pages",
+                        2: "gqa_page_size",
+                    }
 
         # TODO Update the get_padding_shape_from_config method to handle the case when the model config has attention_chunk_size or sliding_window and it should return a list of shapes for each layer
         if hasattr(self.model, "get_onnx_retained_state_specs"):
@@ -4530,6 +4539,14 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
                 if hasattr(self.model, "get_pkv_dynamic_axes")
                 else pkv_dynamic_axes
             )
+            if supports_paged_gqa and decode_only_export:
+                if isinstance(pkv_dynamic_axes, dict):
+                    pkv_dynamic_axes = {axis: name for axis, name in pkv_dynamic_axes.items() if axis != 2}
+                else:
+                    pkv_dynamic_axes = [
+                        {axis: name for axis, name in layer_axes.items() if axis != 2}
+                        for layer_axes in pkv_dynamic_axes
+                    ]
             pkv_dynamic_axes = (
                 [pkv_dynamic_axes] * self.model.config.num_hidden_layers
                 if isinstance(pkv_dynamic_axes, dict)

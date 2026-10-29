@@ -183,7 +183,7 @@ def main() -> None:
     )
     parser.add_argument("--attn-dp", type=int, default=1)
     parser.add_argument("--attn-cp", type=int, default=1)
-    parser.add_argument("--num-cores", type=int, default=16)
+    parser.add_argument("--num-cores", type=int, default=4)
     parser.add_argument(
         "--expert-parallel-chunk-size",
         type=int,
@@ -257,6 +257,7 @@ def main() -> None:
 
     decode_qaic_config = {
         "blocking_mode": "kv_headpar_paged",
+        "ctx_len": args.ctx_len,
         "num_kv_blocks": args.num_kv_blocks,
         "headpar_split": args.num_cores,
         "attn_dp": args.attn_dp,
@@ -315,6 +316,7 @@ def main() -> None:
         args.model_id,
         config=model_config,
         dtype=torch.float16,
+        weight_free=True,
     )
     compile_kwargs = {
         "batch_size": args.batch_size,

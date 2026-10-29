@@ -86,6 +86,24 @@ def ctx_chunk_scatter_batch(data: torch.Tensor, position_ids: torch.Tensor, upda
     )
 
 
+def ctx_paged_scatter_dp(
+    data: torch.Tensor, block_id: torch.Tensor, addr: torch.Tensor, updates: torch.Tensor
+) -> torch.Tensor:
+    from QEfficient.customop.ctx_scatter_gather import CtxPagedScatterFuncDP
+
+    return select_interface(CtxPagedScatterFuncDP.apply, torch.ops.qefficient.ctx_paged_scatter_dp)(
+        data, block_id, addr, updates
+    )
+
+
+def ctx_paged_scatter_page(data: torch.Tensor, block_id: torch.Tensor, updates: torch.Tensor) -> torch.Tensor:
+    from QEfficient.customop.ctx_scatter_gather import CtxPagedScatterFuncPage
+
+    return select_interface(CtxPagedScatterFuncPage.apply, torch.ops.qefficient.ctx_paged_scatter_page)(
+        data, block_id, updates
+    )
+
+
 def ctx_gather_blocked_kv_batch(data: torch.Tensor, ctx_indices: torch.Tensor) -> torch.Tensor:
     from QEfficient.customop.ctx_scatter_gather import CtxGatherFuncBlockedKVBatch
 

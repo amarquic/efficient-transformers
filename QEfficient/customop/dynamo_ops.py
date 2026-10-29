@@ -13,6 +13,8 @@ from QEfficient.customop.ctx_scatter_gather import (
     CtxGather3D,
     CtxGatherBlockedKV,
     CtxGatherBlockedKVBatch,
+    CtxPagedScatterDP,
+    CtxPagedScatterPage,
     CtxScatter,
     CtxScatter3D,
     CtxScatter3DInt,
@@ -56,6 +58,39 @@ def ctx_scatter_op(data: torch.Tensor, position_ids: torch.Tensor, updates: torc
 @ctx_scatter_op.register_fake
 def _(data: torch.Tensor, position_ids: torch.Tensor, updates: torch.Tensor) -> torch.Tensor:
     """Fake implementation for torch.export - just returns data tensor with same shape/dtype"""
+    return torch.empty_like(data)
+
+
+@torch.library.custom_op("qefficient::ctx_paged_scatter_dp", mutates_args=())
+def ctx_paged_scatter_dp_op(
+    data: torch.Tensor, block_id: torch.Tensor, addr: torch.Tensor, updates: torch.Tensor
+) -> torch.Tensor:
+    """Scatter token updates into a paged KV cache."""
+    batch, rows, seq_len, _ = updates.shape
+    row_idx = torch.arange(rows, device=data.device).view(1, rows, 1).expand(batch, rows, seq_len)
+    result = data.clone()
+    valid = block_id != torch.iinfo(torch.int32).max
+    result[block_id[valid].long(), row_idx[valid], addr[valid].long()] = updates[valid]
+    return result
+
+
+@ctx_paged_scatter_dp_op.register_fake
+def _(data: torch.Tensor, block_id: torch.Tensor, addr: torch.Tensor, updates: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(data)
+
+
+@torch.library.custom_op("qefficient::ctx_paged_scatter_page", mutates_args=())
+def ctx_paged_scatter_page_op(data: torch.Tensor, block_id: torch.Tensor, updates: torch.Tensor) -> torch.Tensor:
+    """Scatter complete pages into a paged KV cache."""
+    result = data.clone()
+    page_idx = block_id.long()
+    heads = torch.arange(data.shape[1], device=data.device).view(1, -1).expand_as(block_id)
+    result[page_idx, heads] = updates
+    return result
+
+
+@ctx_paged_scatter_page_op.register_fake
+def _(data: torch.Tensor, block_id: torch.Tensor, updates: torch.Tensor) -> torch.Tensor:
     return torch.empty_like(data)
 
 
@@ -432,5 +467,7 @@ DYNAMO_CUSTOM_OP_TABLE = {
     torch.ops.qefficient.ctx_gather_blocked_kv_cb.default: get_dynamo_onnxscript_func(CtxGatherBlockedKVCB),
     torch.ops.qefficient.ctx_gather_3d_generalized.default: get_dynamo_onnxscript_func(CtxGather3D),
     torch.ops.qefficient.ctx_chunk_scatter_batch.default: get_dynamo_onnxscript_func(CtxChunkScatterBatch),
+    torch.ops.qefficient.ctx_paged_scatter_dp.default: get_dynamo_onnxscript_func(CtxPagedScatterDP),
+    torch.ops.qefficient.ctx_paged_scatter_page.default: get_dynamo_onnxscript_func(CtxPagedScatterPage),
     torch.ops.qefficient.ctx_gather_blocked_kv_batch.default: get_dynamo_onnxscript_func(CtxGatherBlockedKVBatch),
 }

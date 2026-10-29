@@ -311,6 +311,8 @@ class PreserveNestedCacheRetainedStateTransform(BaseOnnxTransform):
             "CtxScatter3D",
             "CtxScatter3DInt",
             "CtxScatterCB3D",
+            "CtxPagedScatterDP",
+            "CtxPagedScatterPage",
         }
     )
 
@@ -347,24 +349,37 @@ class PreserveNestedCacheRetainedStateTransform(BaseOnnxTransform):
 
         scatter_outputs: dict[str, str] = {}
         for state_kind, function_input in function_state_inputs.items():
-            writers = [
-                fn_node
-                for fn_node in fn.node
-                if fn_node.op_type in cls._SCATTER_OP_TYPES
-                and fn_node.input
-                and fn_node.input[0] == function_input
-                and fn_node.output
-            ]
-            if len(writers) != 1:
-                writer_names = [
-                    f"{writer.op_type}({writer.output[0] if writer.output else '<no-output>'})" for writer in writers
+            current_value = function_input
+            writer_chain = []
+            visited_values = set()
+            while current_value not in visited_values:
+                visited_values.add(current_value)
+                writers = [
+                    fn_node
+                    for fn_node in fn.node
+                    if fn_node.op_type in cls._SCATTER_OP_TYPES
+                    and fn_node.input
+                    and fn_node.input[0] == current_value
+                    and fn_node.output
                 ]
+                if not writers:
+                    break
+                if len(writers) != 1:
+                    writer_names = [f"{writer.op_type}({writer.output[0]})" for writer in writers]
+                    raise ValueError(
+                        f"Could not uniquely resolve the nested {state_kind}.{layer_idx} state writer in function "
+                        f"'{fn.name}': cache value '{current_value}' has {len(writers)} writers ({writer_names})."
+                    )
+                writer = writers[0]
+                writer_chain.append(writer)
+                current_value = writer.output[0]
+
+            if not writer_chain:
                 raise ValueError(
                     f"Could not uniquely resolve the nested {state_kind}.{layer_idx} state writer in function "
-                    f"'{fn.name}': expected one CtxScatter* with data input '{function_input}', "
-                    f"found {len(writers)} ({writer_names})."
+                    f"'{fn.name}': expected a cache-scatter chain with data input '{function_input}', found none."
                 )
-            scatter_outputs[state_kind] = writers[0].output[0]
+            scatter_outputs[state_kind] = current_value
 
         return scatter_outputs
 

@@ -15,8 +15,6 @@ from transformers.cache_utils import Cache, CacheLayerMixin, EncoderDecoderCache
 from QEfficient.customop import (
     CtxGatherFuncBlockedKVBatch,
     CtxGatherFuncPagedAttention,  # TODO: apply the dynamo related changes coming from latest mainline
-    CtxPagedScatterFuncDP,
-    CtxPagedScatterFuncPage,
     CtxScatterFuncPagedAttention,  # TODO: apply the dynamo related changes coming from latest mainline
     ctx_chunk_scatter_batch,
     ctx_gather,
@@ -25,6 +23,8 @@ from QEfficient.customop import (
     ctx_gather_blocked_kv_cb,
     ctx_gather_cb,
     ctx_gather_cb_3d,
+    ctx_paged_scatter_dp,
+    ctx_paged_scatter_page,
     ctx_scatter,
     ctx_scatter_3d,
     ctx_scatter_cb,
@@ -613,10 +613,14 @@ class QEffDynamicLayer(CacheLayerMixin):
             raise ValueError(f"Paged GQA block_table must have shape [{dp}, {batch_local}, pages].")
 
         position_dp = position_ids.view(dp, batch_local, seq_len).permute(1, 0, 2)
-        logical_page = position_dp // page_block_size
-        logical_page_group = logical_page // cp
+        logical_page = torch.div(position_dp, page_block_size, rounding_mode="trunc")
+        logical_page_group = torch.div(logical_page, cp, rounding_mode="trunc")
         owner_cp = logical_page % cp
-        if not torch.onnx.is_in_onnx_export() and int(logical_page_group.max()) >= block_table.shape[-1]:
+        if (
+            not torch.onnx.is_in_onnx_export()
+            and not torch._dynamo.is_compiling()
+            and int(logical_page_group.max()) >= block_table.shape[-1]
+        ):
             raise ValueError("Paged GQA block_table is too short for the requested position_ids.")
         table = block_table.permute(1, 0, 2)
         physical_page = torch.gather(table, 2, logical_page_group.to(torch.int64))
@@ -647,7 +651,7 @@ class QEffDynamicLayer(CacheLayerMixin):
             .expand(batch_local, dp, cp, num_kv_heads, seq_len, head_dim)
             .reshape(batch_local, rows, seq_len, head_dim)
         )
-        is_export = torch.onnx.is_in_onnx_export() or torch.jit.is_tracing()
+        is_export = torch.onnx.is_in_onnx_export() or torch.jit.is_tracing() or torch._dynamo.is_compiling()
         page_aligned = dp == 1 and cp == 1 and seq_len % page_block_size == 0
         if page_aligned and not is_export:
             page_aligned = bool(
@@ -656,7 +660,9 @@ class QEffDynamicLayer(CacheLayerMixin):
             )
         if page_aligned:
             num_pages = seq_len // page_block_size
-            logical_pages = (position_ids[:, ::page_block_size] // page_block_size).to(torch.int64)
+            logical_pages = torch.div(
+                position_ids[:, ::page_block_size], page_block_size, rounding_mode="trunc"
+            ).to(torch.int64)
             physical_pages = torch.gather(block_table[0].to(torch.int64), 1, logical_pages).to(torch.int32)
             for batch_idx in range(batch):
                 page_ids = physical_pages[batch_idx].view(num_pages, 1).expand(num_pages, num_kv_heads)
@@ -670,11 +676,11 @@ class QEffDynamicLayer(CacheLayerMixin):
                     .reshape(num_kv_heads, num_pages, page_block_size, head_dim)
                     .permute(1, 0, 2, 3)
                 )
-                self.keys = CtxPagedScatterFuncPage.apply(self.keys, page_ids, key_pages)
-                self.values = CtxPagedScatterFuncPage.apply(self.values, page_ids, value_pages)
+                self.keys = ctx_paged_scatter_page(self.keys, page_ids, key_pages)
+                self.values = ctx_paged_scatter_page(self.values, page_ids, value_pages)
             return self.keys, self.values
-        self.keys = CtxPagedScatterFuncDP.apply(self.keys, block_id.to(torch.int32), address, key_updates)
-        self.values = CtxPagedScatterFuncDP.apply(self.values, block_id.to(torch.int32), address, value_updates)
+        self.keys = ctx_paged_scatter_dp(self.keys, block_id.to(torch.int32), address, key_updates)
+        self.values = ctx_paged_scatter_dp(self.values, block_id.to(torch.int32), address, value_updates)
         return self.keys, self.values
 
     def write_only(self, key_states, value_states, cache_kwargs):

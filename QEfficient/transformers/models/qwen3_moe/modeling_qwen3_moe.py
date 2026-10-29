@@ -83,6 +83,11 @@ def qeff_apply_rotary_pos_emb(q, k, cos, sin):
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
 
+    # Create the shared attention-head axis inside the decoder subfunction so
+    # non-strict export keeps this dimension statically equal to one.
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
+
     # Apply rotation
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
@@ -383,8 +388,8 @@ class QEffQwen3MoeModel(Qwen3MoeModel):
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
-        sin = self.sin_cached[position_ids].unsqueeze(1).to(device=hidden_states.device)
-        cos = self.cos_cached[position_ids].unsqueeze(1).to(device=hidden_states.device)
+        sin = self.sin_cached[position_ids].to(device=hidden_states.device)
+        cos = self.cos_cached[position_ids].to(device=hidden_states.device)
 
         for layer_idx, decoder_layer in enumerate(self.layers):
             if layer_idx < start or layer_idx >= end:
