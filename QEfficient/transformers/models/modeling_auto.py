@@ -4488,16 +4488,20 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
                     attn_dp, batch_local, num_page_groups
                 )
                 if decode_only_export:
-                    dynamic_axes["input_ids"] = {}
-                    dynamic_axes["position_ids"] = {}
-                    dynamic_axes["block_table"] = {}
+                    dynamic_axes["input_ids"] = {0: "batch_size"}
+                    dynamic_axes["position_ids"] = {0: "batch_size"}
+                    dynamic_axes["block_table"] = {
+                        1: "batch_size" if attn_dp == 1 else "gqa_batch_local"
+                    }
                     pkv_dynamic_axes = {0: "gqa_physical_pages"}
                 else:
-                    dynamic_axes["block_table"] = {1: "gqa_batch_local", 2: "gqa_page_groups"}
-                    pkv_dynamic_axes = {
-                        0: "gqa_physical_pages",
-                        2: "gqa_page_size",
-                    }
+                    # Prefill currently uses DP=CP=1, so block_table axis 1 is
+                    # exactly the model input batch. Page-pool capacity, logical
+                    # page count, and page size are compile-time capacities.
+                    dynamic_axes["input_ids"] = {0: "batch_size"}
+                    dynamic_axes["position_ids"] = {0: "batch_size"}
+                    dynamic_axes["block_table"] = {1: "batch_size"}
+                    pkv_dynamic_axes = {}
 
         # TODO Update the get_padding_shape_from_config method to handle the case when the model config has attention_chunk_size or sliding_window and it should return a list of shapes for each layer
         if hasattr(self.model, "get_onnx_retained_state_specs"):
@@ -4539,14 +4543,19 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
                 if hasattr(self.model, "get_pkv_dynamic_axes")
                 else pkv_dynamic_axes
             )
-            if supports_paged_gqa and decode_only_export:
-                if isinstance(pkv_dynamic_axes, dict):
-                    pkv_dynamic_axes = {axis: name for axis, name in pkv_dynamic_axes.items() if axis != 2}
+            if supports_paged_gqa:
+                if decode_only_export:
+                    if isinstance(pkv_dynamic_axes, dict):
+                        pkv_dynamic_axes = {axis: name for axis, name in pkv_dynamic_axes.items() if axis != 2}
+                    else:
+                        pkv_dynamic_axes = [
+                            {axis: name for axis, name in layer_axes.items() if axis != 2}
+                            for layer_axes in pkv_dynamic_axes
+                        ]
                 else:
-                    pkv_dynamic_axes = [
-                        {axis: name for axis, name in layer_axes.items() if axis != 2}
-                        for layer_axes in pkv_dynamic_axes
-                    ]
+                    # Paged prefill keeps the physical pool and page geometry
+                    # fixed; only the request batch is symbolic.
+                    pkv_dynamic_axes = {}
             pkv_dynamic_axes = (
                 [pkv_dynamic_axes] * self.model.config.num_hidden_layers
                 if isinstance(pkv_dynamic_axes, dict)
@@ -4919,6 +4928,7 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         offload_pt_weights: bool | None = True,
         enable_chunking: bool | None = False,
         retain_full_kv: bool | None = None,
+        retained_state: bool = True,
         layerwise: bool = False,
         layerwise_window_size: int = 1,
         kv_cache_prefix: str | None = None,
@@ -5283,7 +5293,7 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         qpc_path = self._compile(
             onnx_path=onnx_path,
             compile_dir=compile_dir,
-            retained_state=True,
+            retained_state=retained_state,
             specializations=specializations,
             convert_to_fp16=_should_convert_to_fp16(target_dtype, compiler_options),
             mxfp6_matmul=mxfp6_matmul,

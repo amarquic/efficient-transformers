@@ -664,20 +664,43 @@ class QEffDynamicLayer(CacheLayerMixin):
                 position_ids[:, ::page_block_size], page_block_size, rounding_mode="trunc"
             ).to(torch.int64)
             physical_pages = torch.gather(block_table[0].to(torch.int64), 1, logical_pages).to(torch.int32)
-            for batch_idx in range(batch):
-                page_ids = physical_pages[batch_idx].view(num_pages, 1).expand(num_pages, num_kv_heads)
+
+            def scatter_cond(batch_idx, key_cache, value_cache):
+                return batch_idx < batch
+
+            def scatter_body(batch_idx, key_cache, value_cache):
+                update_index = batch_idx.view(1).to(torch.int64)
+                page_ids = (
+                    torch.index_select(physical_pages, 0, update_index)
+                    .squeeze(0)
+                    .view(num_pages, 1)
+                    .expand(num_pages, num_kv_heads)
+                )
+                key_batch = torch.index_select(key_states, 0, update_index).squeeze(0)
+                value_batch = torch.index_select(value_states, 0, update_index).squeeze(0)
                 key_pages = (
-                    key_states[batch_idx]
+                    key_batch
                     .reshape(num_kv_heads, num_pages, page_block_size, head_dim)
                     .permute(1, 0, 2, 3)
                 )
                 value_pages = (
-                    value_states[batch_idx]
+                    value_batch
                     .reshape(num_kv_heads, num_pages, page_block_size, head_dim)
                     .permute(1, 0, 2, 3)
                 )
-                self.keys = ctx_paged_scatter_page(self.keys, page_ids, key_pages)
-                self.values = ctx_paged_scatter_page(self.values, page_ids, value_pages)
+                key_cache = ctx_paged_scatter_page(key_cache, page_ids, key_pages)
+                value_cache = ctx_paged_scatter_page(value_cache, page_ids, value_pages)
+                return batch_idx + 1, key_cache, value_cache
+
+            _, self.keys, self.values = torch.while_loop(
+                scatter_cond,
+                scatter_body,
+                (
+                    torch.zeros((), dtype=torch.int64, device=key_states.device),
+                    self.keys,
+                    self.values,
+                ),
+            )
             return self.keys, self.values
         self.keys = ctx_paged_scatter_dp(self.keys, block_id.to(torch.int32), address, key_updates)
         self.values = ctx_paged_scatter_dp(self.values, block_id.to(torch.int32), address, value_updates)

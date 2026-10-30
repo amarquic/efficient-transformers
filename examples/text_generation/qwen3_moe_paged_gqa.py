@@ -324,6 +324,7 @@ def main() -> None:
         "num_cores": args.num_cores,
         "num_devices": len(args.device_group),
         "mxfp6_matmul": True,
+        "mxint8_kv_cache": True,
         "use_onnx_subfunctions": True,
         "user_tiled": True,
         "retain_full_kv": True,

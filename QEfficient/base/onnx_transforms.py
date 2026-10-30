@@ -317,7 +317,130 @@ class PreserveNestedCacheRetainedStateTransform(BaseOnnxTransform):
     )
 
     @classmethod
-    def _resolve_state_scatter_outputs(cls, fn, node, layer_idx: str, state_kinds: set[str]) -> dict[str, str] | None:
+    def _make_loop_initial_conditions_constant(cls, model: ModelProto) -> bool:
+        """Canonicalize exported torch.while_loop initial conditions for QAIC.
+
+        torch exports ``while_loop`` without a trip count and computes its
+        initial condition from the loop counter and dynamic batch size. These
+        paged-attention loops always start at zero and batch size is constrained
+        to be positive, so the initial condition is necessarily true. QAIC
+        requires that input to be a literal constant; the body condition remains
+        dynamic and still terminates the loop at the runtime batch size.
+        """
+        changed = False
+        for fn in model.functions:
+            original_nodes = list(fn.node)
+            used_values = set(fn.input) | set(fn.output)
+            used_node_names = {fn_node.name for fn_node in fn.node if fn_node.name}
+            for fn_node in fn.node:
+                used_values.update(fn_node.input)
+                used_values.update(fn_node.output)
+
+            constants = []
+            for loop_node in original_nodes:
+                if loop_node.op_type != "Loop" or len(loop_node.input) < 2 or loop_node.input[0] != "":
+                    continue
+                condition_name = loop_node.input[1]
+                condition_producers = [
+                    fn_node for fn_node in original_nodes if condition_name and condition_name in fn_node.output
+                ]
+                if len(condition_producers) != 1 or "while_loop_cond_graph" not in condition_producers[0].op_type:
+                    continue
+
+                constant_output = f"{loop_node.name or 'while_loop'}_initial_condition_true"
+                suffix = 0
+                while constant_output in used_values:
+                    suffix += 1
+                    constant_output = f"{loop_node.name or 'while_loop'}_initial_condition_true_{suffix}"
+                used_values.add(constant_output)
+
+                constant_name = f"{constant_output}_Constant"
+                suffix = 0
+                while constant_name in used_node_names:
+                    suffix += 1
+                    constant_name = f"{constant_output}_Constant_{suffix}"
+                used_node_names.add(constant_name)
+
+                constants.append(
+                    onnx.helper.make_node(
+                        "Constant",
+                        inputs=[],
+                        outputs=[constant_output],
+                        name=constant_name,
+                        value=numpy_helper.from_array(np.asarray(True, dtype=np.bool_), name=constant_output),
+                    )
+                )
+                loop_node.input[1] = constant_output
+                changed = True
+
+            for constant in reversed(constants):
+                fn.node.insert(0, constant)
+        return changed
+
+    @classmethod
+    def _has_scatter_chain(cls, fn, function_input: str, function_output: str) -> bool:
+        """Return whether ``function_output`` is written from ``function_input`` by cache scatters."""
+        current_value = function_input
+        visited_values = set()
+        while current_value not in visited_values:
+            if current_value == function_output:
+                return True
+            visited_values.add(current_value)
+            writers = [
+                fn_node
+                for fn_node in fn.node
+                if fn_node.op_type in cls._SCATTER_OP_TYPES
+                and fn_node.input
+                and fn_node.input[0] == current_value
+                and fn_node.output
+            ]
+            if len(writers) != 1:
+                return False
+            current_value = writers[0].output[0]
+        return False
+
+    @classmethod
+    def _loop_carries_scatter(cls, loop_node, loop_input_index: int, fn_by_name: dict) -> bool:
+        """Check that a Loop carried input is returned through a cache-scatter body path."""
+        body_attributes = [attribute for attribute in loop_node.attribute if attribute.name == "body"]
+        if len(body_attributes) != 1:
+            return False
+        body = body_attributes[0].g
+
+        # Loop inputs are (trip_count, condition, carried...). The body adds a
+        # leading condition output, so carried input i maps to body output i - 1.
+        body_output_index = loop_input_index - 1
+        if loop_input_index >= len(body.input) or body_output_index >= len(body.output):
+            return False
+        body_input = body.input[loop_input_index].name
+        body_output = body.output[body_output_index].name
+
+        producers = [body_node for body_node in body.node if body_output in body_node.output]
+        if len(producers) != 1:
+            return False
+        producer = producers[0]
+        producer_output_index = list(producer.output).index(body_output)
+
+        if producer.op_type in cls._SCATTER_OP_TYPES:
+            return bool(producer.input) and producer.input[0] == body_input
+
+        body_fn = fn_by_name.get(producer.op_type)
+        if body_fn is None or producer_output_index >= len(body_fn.output):
+            return False
+        matching_input_indices = [
+            input_index for input_index, input_name in enumerate(producer.input) if input_name == body_input
+        ]
+        if len(matching_input_indices) != 1:
+            return False
+        input_index = matching_input_indices[0]
+        if input_index >= len(body_fn.input):
+            return False
+        return cls._has_scatter_chain(body_fn, body_fn.input[input_index], body_fn.output[producer_output_index])
+
+    @classmethod
+    def _resolve_state_scatter_outputs(
+        cls, fn, node, layer_idx: str, state_kinds: set[str], fn_by_name: dict
+    ) -> dict[str, str] | None:
         """Resolve nested cache-state scatter outputs from function data flow.
 
         ONNX function-call inputs bind positionally. Each cache scatter consumes
@@ -354,7 +477,7 @@ class PreserveNestedCacheRetainedStateTransform(BaseOnnxTransform):
             visited_values = set()
             while current_value not in visited_values:
                 visited_values.add(current_value)
-                writers = [
+                scatter_writers = [
                     fn_node
                     for fn_node in fn.node
                     if fn_node.op_type in cls._SCATTER_OP_TYPES
@@ -362,17 +485,34 @@ class PreserveNestedCacheRetainedStateTransform(BaseOnnxTransform):
                     and fn_node.input[0] == current_value
                     and fn_node.output
                 ]
+                loop_writers = []
+                for fn_node in fn.node:
+                    if fn_node.op_type != "Loop":
+                        continue
+                    carried_input_indices = [
+                        input_index
+                        for input_index, input_name in enumerate(fn_node.input)
+                        if input_index >= 2 and input_name == current_value
+                    ]
+                    for input_index in carried_input_indices:
+                        output_index = input_index - 2
+                        if output_index >= len(fn_node.output):
+                            continue
+                        if cls._loop_carries_scatter(fn_node, input_index, fn_by_name):
+                            loop_writers.append((fn_node, fn_node.output[output_index]))
+
+                writers = [(writer, writer.output[0]) for writer in scatter_writers] + loop_writers
                 if not writers:
                     break
                 if len(writers) != 1:
-                    writer_names = [f"{writer.op_type}({writer.output[0]})" for writer in writers]
+                    writer_names = [f"{writer.op_type}({output})" for writer, output in writers]
                     raise ValueError(
                         f"Could not uniquely resolve the nested {state_kind}.{layer_idx} state writer in function "
                         f"'{fn.name}': cache value '{current_value}' has {len(writers)} writers ({writer_names})."
                     )
-                writer = writers[0]
+                writer, writer_output = writers[0]
                 writer_chain.append(writer)
-                current_value = writer.output[0]
+                current_value = writer_output
 
             if not writer_chain:
                 raise ValueError(
@@ -386,15 +526,15 @@ class PreserveNestedCacheRetainedStateTransform(BaseOnnxTransform):
     @classmethod
     def apply(cls, model: ModelProto) -> bool:
         graph = model.graph
+        changed = cls._make_loop_initial_conditions_constant(model)
         produced_names = {name for node in graph.node for name in node.output}
         dangling_retained_outputs = {
             out.name for out in graph.output if out.name.endswith("_RetainedState") and out.name not in produced_names
         }
         if not dangling_retained_outputs:
-            return False
+            return changed
 
         fn_by_name = {fn.name: fn for fn in model.functions}
-        changed = False
         state_rename_map: dict[str, str] = {}
         remaining_dangling_outputs = set(dangling_retained_outputs)
 
@@ -446,7 +586,9 @@ class PreserveNestedCacheRetainedStateTransform(BaseOnnxTransform):
                         f"expected={sorted(desired_outputs.values())}."
                     )
 
-                scatter_outputs = cls._resolve_state_scatter_outputs(fn, node, layer_idx, set(state_inputs))
+                scatter_outputs = cls._resolve_state_scatter_outputs(
+                    fn, node, layer_idx, set(state_inputs), fn_by_name
+                )
                 if scatter_outputs is None:
                     continue
 

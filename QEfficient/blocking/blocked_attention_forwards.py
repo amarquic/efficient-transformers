@@ -328,14 +328,38 @@ def _paged_gqa_prefill_attention(
                     break
             page_start = start_index // page_block_size
             page_end = end_index // page_block_size
-            key_batches = []
-            value_batches = []
-            for batch_idx in range(batch):
-                page_ids = block_table[batch_idx, page_start:page_end].view(-1, 1).expand(-1, num_kv_heads)
-                key_batches.append(CtxGatherFuncPagedKVDP.apply(key_cache, page_ids.to(torch.int32)))
-                value_batches.append(CtxGatherFuncPagedKVDP.apply(value_cache, page_ids.to(torch.int32)))
-            key_block = repeat_kv(torch.cat(key_batches, dim=0), kv_repeat)
-            value_block = repeat_kv(torch.cat(value_batches, dim=0), kv_repeat)
+            pages_per_block = page_end - page_start
+            gathered_shape = (batch, num_kv_heads, pages_per_block * page_block_size, head_dim)
+
+            def gather_cond(batch_idx, key_batches, value_batches):
+                return batch_idx < batch
+
+            def gather_body(batch_idx, key_batches, value_batches):
+                update_index = batch_idx.view(1).to(torch.int64)
+                page_ids = (
+                    torch.index_select(block_table, 0, update_index)
+                    .squeeze(0)[page_start:page_end]
+                    .view(pages_per_block, 1)
+                    .expand(pages_per_block, num_kv_heads)
+                    .to(torch.int32)
+                )
+                gathered_key = CtxGatherFuncPagedKVDP.apply(key_cache, page_ids)
+                gathered_value = CtxGatherFuncPagedKVDP.apply(value_cache, page_ids)
+                key_batches = torch.index_copy(key_batches, 0, update_index, gathered_key)
+                value_batches = torch.index_copy(value_batches, 0, update_index, gathered_value)
+                return batch_idx + 1, key_batches, value_batches
+
+            _, key_block, value_block = torch.while_loop(
+                gather_cond,
+                gather_body,
+                (
+                    torch.zeros((), dtype=torch.int64, device=query.device),
+                    torch.empty(gathered_shape, dtype=key_cache.dtype, device=key_cache.device),
+                    torch.empty(gathered_shape, dtype=value_cache.dtype, device=value_cache.device),
+                ),
+            )
+            key_block = repeat_kv(key_block, kv_repeat)
+            value_block = repeat_kv(value_block, kv_repeat)
             key_positions = torch.arange(start_index, end_index, device=query.device)
             key_block_transposed = key_block.transpose(2, 3)
             invalid_value = key_positions[None, None, :] > position_ids.max(dim=1, keepdim=True).values.unsqueeze(1)
@@ -562,19 +586,35 @@ def paged_gqa_attention_forward(
         ),
     )
 
-    batch_maxima = []
-    batch_sums = []
-    batch_outputs = []
     is_export = torch.onnx.is_in_onnx_export() or torch.jit.is_tracing()
-    for batch_idx in range(batch_local):
-        query_local = query_dp[batch_idx].reshape(dp, num_kv_heads, query_len_effective, head_dim)
+    maxima_buffer = torch.empty(
+        (num_kv_blocks, batch_local, rows, num_cores, query_len_effective),
+        dtype=torch.float32,
+        device=query.device,
+    )
+    sums_buffer = torch.empty_like(maxima_buffer)
+    outputs_buffer = torch.empty(
+        (num_kv_blocks, batch_local, rows, num_cores, query_len_effective, head_dim),
+        dtype=torch.float32,
+        device=query.device,
+    )
+
+    def decode_batch_cond(batch_idx, maxima_batches, sums_batches, output_batches):
+        return batch_idx < batch_local
+
+    def decode_batch_body(batch_idx, maxima_batches, sums_batches, output_batches):
+        update_index = batch_idx.view(1).to(torch.int64)
+        query_local = torch.index_select(query_dp, 0, update_index).squeeze(0).reshape(
+            dp, num_kv_heads, query_len_effective, head_dim
+        )
         query_rows = (
             query_local.unsqueeze(1)
             .expand(dp, cp, num_kv_heads, query_len_effective, head_dim)
             .reshape(1, rows, query_len_effective, head_dim)
         )
         query_core = query_rows.unsqueeze(2).expand(1, rows, num_cores, query_len_effective, head_dim)
-        table = block_table[:, batch_idx]
+        table = torch.index_select(block_table, 1, update_index).squeeze(1)
+        batch_thresholds = torch.index_select(thresholds, 0, update_index)
         maxima = []
         sums = []
         outputs = []
@@ -582,7 +622,7 @@ def paged_gqa_attention_forward(
             1, rows, num_cores, tokens_per_core, head_dim
         )
         for block_idx in range(num_kv_blocks):
-            threshold = thresholds[batch_idx : batch_idx + 1, :, :, block_idx]
+            threshold = batch_thresholds[:, :, :, block_idx]
             skip_future = (threshold < 0).unsqueeze(-1)
             causal_mask = torch.arange(tokens_per_core, device=query.device).view(1, 1, 1, tokens_per_core)
             causal_mask = causal_mask > threshold.unsqueeze(-1)
@@ -611,13 +651,21 @@ def paged_gqa_attention_forward(
             outputs.append(block_output)
             if next_key_block is not None:
                 key_block = next_key_block.view(1, rows, num_cores, tokens_per_core, head_dim)
-        batch_maxima.append(torch.stack(maxima))
-        batch_sums.append(torch.stack(sums))
-        batch_outputs.append(torch.stack(outputs))
+        maxima_batches = torch.index_copy(maxima_batches, 1, update_index, torch.stack(maxima))
+        sums_batches = torch.index_copy(sums_batches, 1, update_index, torch.stack(sums))
+        output_batches = torch.index_copy(output_batches, 1, update_index, torch.stack(outputs))
+        return batch_idx + 1, maxima_batches, sums_batches, output_batches
 
-    maxima = torch.cat(batch_maxima, dim=1)
-    sums = torch.cat(batch_sums, dim=1)
-    outputs = torch.cat(batch_outputs, dim=1)
+    _, maxima, sums, outputs = torch.while_loop(
+        decode_batch_cond,
+        decode_batch_body,
+        (
+            torch.zeros((), dtype=torch.int64, device=query.device),
+            maxima_buffer,
+            sums_buffer,
+            outputs_buffer,
+        ),
+    )
     block_max = maxima.max(dim=0).values
     block_weight = torch.exp(maxima - block_max.unsqueeze(0))
     block_sum = (block_weight * sums).sum(dim=0)
